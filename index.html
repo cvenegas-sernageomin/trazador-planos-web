@@ -1291,6 +1291,20 @@ async function getElevacionesMixta(points) {
 // Convención de ángulos: azimutDeg 0-360° desde el norte (sentido horario).
 // inclinacionDeg: 0°=horizontal, +90°=cenit (mirando al cielo), -90°=nadir (mirando al suelo).
 
+const GPS_OBSOLETO_MS = 8000;  // sin fix nuevo por más de esto → no dejar marcar puntos
+const TELEMETRO_MS    = 200;   // recálculo del rayo (5 Hz); los sensores llegan mucho más rápido
+
+// Zona UTM sugerida por la longitud (evita el clásico "quedé con 19S estando en 18S").
+function zonaUTMDesdeLon(lon) {
+  const z = Math.floor((lon + 180) / 6) + 1 + 'S';
+  return ZONES[z] ? z : null;
+}
+
+// Pendiente en %: no tiene sentido cerca de la vertical (tan → ∞), ahí devuelve null.
+function pendientePorcentaje(incDeg) {
+  return Math.abs(incDeg) >= 89 ? null : Math.tan(toRad(incDeg)) * 100;
+}
+
 // Resolución media de un píxel del DEM activo, en metros (soporta CRS proyectado en
 // metros o geográfico en grados).
 function resolucionMetrosDEM(dem) {
@@ -1332,15 +1346,19 @@ async function rayMarchDEM(lat0, lon0, z0, zona, azimutDeg, inclinacionDeg, opts
   const az  = toRad(azimutDeg);
   const dip = toRad(inclinacionDeg);
   const dEu = Math.sin(az), dNu = Math.cos(az);
+  const cosDip = Math.cos(dip), sinDip = Math.sin(dip);
+  // El origen se pasa a UTM una sola vez: dentro del bucle basta utmToLatLon, la mitad de
+  // trabajo de proj4 por paso (esto corre en bucle continuo a 5 Hz sobre el teléfono).
+  const { E: E0, N: N0 } = latLonToUtm(lat0, lon0, zona);
 
   let dAnt = 0, zAnt = z0;
   let terrenoAnt = await elevacionLocal(lat0, lon0);
   if (terrenoAnt === null) terrenoAnt = z0;
 
   for (let d = paso; d <= distMax; d += paso) {
-    const horiz = d * Math.cos(dip);
-    const zRayo = z0 + d * Math.sin(dip);
-    const { lat, lon } = offsetLatLon(lat0, lon0, zona, horiz * dEu, horiz * dNu);
+    const horiz = d * cosDip;
+    const zRayo = z0 + d * sinDip;
+    const { lat, lon } = utmToLatLon(E0 + horiz * dEu, N0 + horiz * dNu, zona);
     const terreno = await elevacionLocal(lat, lon);
     if (terreno === null) return { ok: false, motivo: 'fuera_de_dem' };
 
@@ -1351,9 +1369,9 @@ async function rayMarchDEM(lat0, lon0, z0, zona, azimutDeg, inclinacionDeg, opts
       // degenerado, ej. rayo horizontal sobre terreno perfectamente plano): cruce en dAnt.
       const t = denom !== 0 ? Math.max(0, Math.min(1, fAnt / denom)) : 0;
       const dCruce = dAnt + t * (d - dAnt);
-      const horizC = dCruce * Math.cos(dip);
-      const zCruce = z0 + dCruce * Math.sin(dip);
-      const { lat: latC, lon: lonC } = offsetLatLon(lat0, lon0, zona, horizC * dEu, horizC * dNu);
+      const horizC = dCruce * cosDip;
+      const zCruce = z0 + dCruce * sinDip;
+      const { lat: latC, lon: lonC } = utmToLatLon(E0 + horizC * dEu, N0 + horizC * dNu, zona);
       return {
         ok: true, lat: latC, lon: lonC, elevacion: zCruce,
         distanciaHorizontal: horizC, distanciaInclinada: dCruce,
@@ -1371,52 +1389,67 @@ async function rayMarchDEM(lat0, lon0, z0, zona, azimutDeg, inclinacionDeg, opts
 function useOrientation() {
   const [estado, setEstado] = useState({
     azimut: null, inclinacion: null, disponible: null,
-    calibrada: true, error: '',
+    absoluta: false, error: '',
   });
-  const ultimoEvento = useRef(0);
+  const ultimoEvento  = useRef(0);
+  const tieneAbsoluto = useRef(false);
+  // Cambia al resolverse el permiso: re-arma la detección de "no hay brújula", que si no
+  // se dispararía mientras el usuario todavía tiene el diálogo de iOS abierto.
+  const [rearme, setRearme] = useState(0);
 
+  // OJO iOS: requestPermission() SOLO funciona dentro de un gesto del usuario, por eso
+  // este método se llama desde el onClick del botón, no desde un useEffect de montaje.
   const solicitarPermiso = async () => {
+    let ok = true;
     if (typeof DeviceOrientationEvent !== 'undefined' &&
         typeof DeviceOrientationEvent.requestPermission === 'function') {
       try {
-        const r = await DeviceOrientationEvent.requestPermission();
-        if (r !== 'granted') {
-          setEstado(s => ({ ...s, error: 'Permiso de orientación denegado' }));
-          return false;
-        }
+        ok = (await DeviceOrientationEvent.requestPermission()) === 'granted';
+        if (!ok) setEstado(s => ({ ...s, disponible: false,
+                                   error: 'Permiso de orientación denegado' }));
       } catch (e) {
-        setEstado(s => ({ ...s, error: 'No se pudo solicitar permiso de orientación' }));
-        return false;
+        ok = false;
+        setEstado(s => ({ ...s, disponible: false,
+                          error: 'No se pudo solicitar permiso de orientación' }));
       }
     }
-    return true;
+    setRearme(Date.now());
+    return ok;
   };
 
   useEffect(() => {
-    const onEvt = (e) => {
-      ultimoEvento.current = Date.now();
+    const procesar = (e, esAbsoluto) => {
       let az;
-      if (typeof e.webkitCompassHeading === 'number') az = e.webkitCompassHeading;
-      else if (e.alpha !== null) az = mod360(360 - e.alpha);
-      else { setEstado(s => ({ ...s, disponible: false })); return; }
-      const inclinacion = e.beta !== null ? e.beta - 90 : null;
+      if (Number.isFinite(e.webkitCompassHeading)) az = e.webkitCompassHeading; // iOS: ya es rumbo
+      else if (Number.isFinite(e.alpha))           az = mod360(360 - e.alpha);  // estándar: alpha crece antihorario
+      else return;                                                              // evento sin datos útiles
+      const inclinacion = Number.isFinite(e.beta) ? e.beta - 90 : null;
+      ultimoEvento.current = Date.now();
       setEstado(s => ({ ...s, azimut: az, inclinacion, disponible: true,
-                        calibrada: e.absolute !== false }));
+                        absoluta: esAbsoluto, error: '' }));
     };
-    window.addEventListener('deviceorientationabsolute', onEvt);
-    window.addEventListener('deviceorientation', onEvt);
+    // Preferir SIEMPRE el evento absoluto: en Android 'deviceorientation' a secas es
+    // relativo y va a la deriva; si dejáramos que ambos escribieran, el relativo pisaría
+    // un rumbo bueno con uno malo intercaladamente.
+    const onAbs = (e) => { tieneAbsoluto.current = true; procesar(e, true); };
+    const onRel = (e) => {
+      if (tieneAbsoluto.current) return;
+      procesar(e, e.absolute === true || Number.isFinite(e.webkitCompassHeading));
+    };
+    window.addEventListener('deviceorientationabsolute', onAbs);
+    window.addEventListener('deviceorientation', onRel);
     const chk = setTimeout(() => {
-      if (ultimoEvento.current === 0) {
-        setEstado(s => ({ ...s, disponible: false,
-                           error: 'Brújula/orientación no disponible en este dispositivo' }));
+      if (ultimoEvento.current <= rearme) {
+        setEstado(s => ({ ...s, disponible: false, error: s.error ||
+          'Sin brújula/inclinómetro: ingresa azimut e inclinación a mano' }));
       }
-    }, 2000);
+    }, 2500);
     return () => {
-      window.removeEventListener('deviceorientationabsolute', onEvt);
-      window.removeEventListener('deviceorientation', onEvt);
+      window.removeEventListener('deviceorientationabsolute', onAbs);
+      window.removeEventListener('deviceorientation', onRel);
       clearTimeout(chk);
     };
-  }, []);
+  }, [rearme]);
 
   return { ...estado, solicitarPermiso };
 }
@@ -1425,6 +1458,8 @@ function useOrientation() {
 function useGeolocacionViva() {
   const [pos, setPos] = useState(null);
   const [error, setError] = useState('');
+  const [obsoleto, setObsoleto] = useState(false);
+
   useEffect(() => {
     if (!navigator.geolocation) { setError('Geolocalización no soportada'); return; }
     const id = navigator.geolocation.watchPosition(
@@ -1438,7 +1473,18 @@ function useGeolocacionViva() {
     );
     return () => navigator.geolocation.clearWatch(id);
   }, []);
-  return { pos, error };
+
+  // La antigüedad del fix hay que vigilarla con un timer propio: comparar Date.now() en el
+  // render no sirve, porque sin cambio de estado nada vuelve a renderizar y el aviso de
+  // "GPS perdido" no aparecería nunca.
+  useEffect(() => {
+    if (!pos) { setObsoleto(false); return; }
+    setObsoleto(false);
+    const id = setInterval(() => setObsoleto(Date.now() - pos.ts > GPS_OBSOLETO_MS), 2000);
+    return () => clearInterval(id);
+  }, [pos]);
+
+  return { pos, error, obsoleto };
 }
 
 // ── Matemática del plano geológico ─────────────────────────
@@ -1602,6 +1648,10 @@ function App() {
   const [tab,      setTab]      = useState('puntuales');
   const [tabInput, setTabInput] = useState(null);
   const [demInfo,  setDemInfo]  = useState(null);
+  // Los puntos del telémetro viven aquí (no en el tab) para que sobrevivan al cambio de
+  // pestaña: son datos medidos en terreno, perderlos al tocar otra pestaña sería grave.
+  const [puntosTel, setPuntosTel] = useState([]);
+  const capasTelRef = useRef({});
   const mapRef  = useRef(null);
   const leafRef = useRef(null);
 
@@ -1647,7 +1697,8 @@ function App() {
             ? <TabPuntuales map={leafRef} externalInput={tabInput} demInfo={demInfo} setDemInfo={setDemInfo} />
             : tab === 'linea'
             ? <TabLinea     map={leafRef} onUsarEnTab1={onUsarEnTab1} />
-            : <TabTelemetro map={leafRef} demInfo={demInfo} />}
+            : <TabTelemetro map={leafRef} demInfo={demInfo}
+                puntos={puntosTel} setPuntos={setPuntosTel} layersRef={capasTelRef} />}
         </div>
       </div>
       <div style={S.mapDiv} ref={mapRef} />
@@ -2364,12 +2415,16 @@ async function exportarKMZLinea(puntos, resultado, zona) {
 // ── Exportación KMZ Telémetro ─────────────────────────────────
 function kmlPuntoTelemetro(p) {
   const kmlColor = hexToKmlColor(p.color);
+  const hora = new Date(p.id).toLocaleString('es-CL');
+  const pend = p.pendientePct === null || p.pendientePct === undefined
+    ? '—' : `${p.pendientePct.toFixed(0)}%`;
   return `
     <Placemark>
-      <name>Telémetro ${new Date(p.id).toLocaleTimeString()}</name>
+      <name>${escapeXML(`Telémetro ${hora}`)}</name>
       <description><![CDATA[
-        Azimut: ${p.az.toFixed(1)}°<br>Inclinación: ${p.inc.toFixed(1)}°<br>Pendiente: ${p.pendientePct.toFixed(0)}%<br>
+        Azimut: ${p.az.toFixed(1)}°<br>Inclinación: ${p.inc.toFixed(1)}°<br>Pendiente: ${pend}<br>
         Dist. horizontal: ${p.distanciaHorizontal.toFixed(1)} m<br>Dist. inclinada: ${p.distanciaInclinada.toFixed(1)} m<br>
+        Dist. vertical: ${p.distanciaVertical.toFixed(1)} m<br>
         Elevación: ${p.elevacion.toFixed(0)} m
       ]]></description>
       <Style><IconStyle><color>${kmlColor}</color><scale>1.0</scale></IconStyle></Style>
@@ -2599,6 +2654,8 @@ const CAM_S = {
   banner:  { position:'absolute', top:'50%', left:12, right:12, transform:'translateY(-50%)',
              background:'rgba(220,38,38,.85)', color:'#fff', borderRadius:8, padding:10,
              fontSize:13, textAlign:'center' },
+  aviso:   { position:'absolute', bottom:112, left:12, right:12, background:'rgba(217,119,6,.9)',
+             color:'#fff', borderRadius:8, padding:'6px 10px', fontSize:12, textAlign:'center' },
   manual:  { position:'absolute', bottom:120, left:12, right:12, display:'flex', gap:8 },
   btnMarcar: { position:'absolute', bottom:24, left:'50%', transform:'translateX(-50%)',
                width:76, height:76, borderRadius:'50%', border:'4px solid #fff',
@@ -2607,41 +2664,103 @@ const CAM_S = {
                border:'none', background:'rgba(0,0,0,.6)', color:'#fff', fontSize:18, cursor:'pointer' },
 };
 
-function CamaraTelemetro({ origenGPS, zona, onMarcar, onCerrar }) {
+function esVertical() {
+  const t = window.screen && window.screen.orientation && window.screen.orientation.type;
+  return t ? t.startsWith('portrait') : window.innerHeight >= window.innerWidth;
+}
+
+function CamaraTelemetro({ origenGPS, zona, orient, nMarcados, onMarcar, onCerrar }) {
   const videoRef  = useRef(null);
   const streamRef = useRef(null);
-  const orient    = useOrientation();
   const [camError, setCamError] = useState('');
   const [lectura,  setLectura]  = useState(null);
   const [azManual, setAzManual]   = useState('');
   const [incManual, setIncManual] = useState('');
+  const [vertical, setVertical]   = useState(esVertical);
   const usarManual = orient.disponible === false;
 
+  // Lo que cambia rápido (sensores a 60 Hz, GPS) viaja por un ref, NO por dependencias del
+  // efecto del intervalo: si fuera dependencia, cada evento de orientación destruiría y
+  // recrearía el intervalo y el tick de 200 ms no alcanzaría a dispararse nunca.
+  // Se sincroniza en un efecto (no durante el render) y va declarado primero, para que ya
+  // tenga datos cuando el efecto del intervalo dispara su primer tick.
+  const entradaRef = useRef({});
   useEffect(() => {
-    orient.solicitarPermiso();
-    navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio: false })
-      .then(s => { streamRef.current = s; if (videoRef.current) videoRef.current.srcObject = s; })
-      .catch(e => setCamError(
-        e.name === 'NotAllowedError' ? 'Permiso de cámara denegado' : 'No se pudo abrir la cámara'
-      ));
-    return () => streamRef.current?.getTracks().forEach(t => t.stop());
+    entradaRef.current = { origenGPS, zona, usarManual, azManual, incManual,
+                           azSensor: orient.azimut, incSensor: orient.inclinacion };
+  });
+
+  useEffect(() => {
+    let cancelado = false;
+    const md = navigator.mediaDevices;
+    // Sin contexto seguro (file:// o http) el navegador ni siquiera expone mediaDevices.
+    if (!md || !md.getUserMedia) {
+      setCamError('Este navegador no expone la cámara. Ábrelo por HTTPS desde el teléfono.');
+      return;
+    }
+    md.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio: false })
+      .then(s => {
+        // Si el overlay se cerró mientras se abría la cámara hay que soltarla igual, o el
+        // stream queda vivo y el indicador de cámara del teléfono no se apaga.
+        if (cancelado) { s.getTracks().forEach(t => t.stop()); return; }
+        streamRef.current = s;
+        if (videoRef.current) videoRef.current.srcObject = s;
+      })
+      .catch(e => {
+        if (cancelado) return;
+        setCamError(e.name === 'NotAllowedError' ? 'Permiso de cámara denegado'
+                  : e.name === 'NotFoundError'  ? 'No se encontró cámara en este dispositivo'
+                  : 'No se pudo abrir la cámara');
+      });
+    return () => {
+      cancelado = true;
+      if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop());
+      streamRef.current = null;
+    };
   }, []);
 
   useEffect(() => {
-    const id = setInterval(async () => {
-      const az  = usarManual ? parseFloat(azManual)  : orient.azimut;
-      const inc = usarManual ? parseFloat(incManual) : orient.inclinacion;
-      if (az == null || isNaN(az) || inc == null || isNaN(inc) || !origenGPS) { setLectura(null); return; }
-      const { z0 } = await origenTelemetro(origenGPS.lat, origenGPS.lon, origenGPS.altitude);
-      const r = await rayMarchDEM(origenGPS.lat, origenGPS.lon, z0, zona, az, inc);
-      setLectura({ az, inc, pendientePct: Math.tan(toRad(inc)) * 100, ...r });
-    }, 200);
-    return () => clearInterval(id);
-  }, [orient.azimut, orient.inclinacion, azManual, incManual, usarManual, origenGPS, zona]);
+    const onGiro = () => setVertical(esVertical());
+    window.addEventListener('orientationchange', onGiro);
+    window.addEventListener('resize', onGiro);
+    return () => {
+      window.removeEventListener('orientationchange', onGiro);
+      window.removeEventListener('resize', onGiro);
+    };
+  }, []);
 
-  const cerrar = () => { streamRef.current?.getTracks().forEach(t => t.stop()); onCerrar(); };
+  useEffect(() => {
+    let cancelado = false, enCurso = false;
+    const tick = async () => {
+      if (enCurso || cancelado) return;   // un ray-marching lento no debe solaparse con el siguiente
+      const e = entradaRef.current;
+      const az  = e.usarManual ? parseFloat(e.azManual)  : e.azSensor;
+      const inc = e.usarManual ? parseFloat(e.incManual) : e.incSensor;
+      // Number.isFinite cubre null, undefined y NaN de una sola vez.
+      if (!e.origenGPS || !Number.isFinite(az) || !Number.isFinite(inc)) {
+        if (!cancelado) setLectura(null);
+        return;
+      }
+      enCurso = true;
+      try {
+        const { z0, fuente } = await origenTelemetro(e.origenGPS.lat, e.origenGPS.lon, e.origenGPS.altitude);
+        const r = await rayMarchDEM(e.origenGPS.lat, e.origenGPS.lon, z0, e.zona, az, inc);
+        if (!cancelado) setLectura({ az, inc, z0, fuenteZ0: fuente,
+                                     pendientePct: pendientePorcentaje(inc), ...r });
+      } finally { enCurso = false; }
+    };
+    const id = setInterval(tick, TELEMETRO_MS);
+    tick();
+    return () => { cancelado = true; clearInterval(id); };
+  }, []);
+
+  const cerrar = () => {
+    if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop());
+    streamRef.current = null;
+    onCerrar();
+  };
   const marcar = () => {
-    if (!lectura?.ok) return;
+    if (!lectura || !lectura.ok) return;
     onMarcar(lectura);
     if (navigator.vibrate) navigator.vibrate(50);
   };
@@ -2651,7 +2770,11 @@ function CamaraTelemetro({ origenGPS, zona, onMarcar, onCerrar }) {
     fuera_de_dem: 'Fuera del área del DEM cargado.',
     apunta_al_cielo: 'Sin intersección con el terreno (apuntando hacia arriba).',
     max_distancia: 'Sin intersección dentro del alcance del DEM.',
+    entrada_invalida: 'Lectura de sensores inválida.',
   };
+  const fila = (etq, val) => (
+    <div style={CAM_S.fila}><span>{etq}</span><b>{val}</b></div>
+  );
 
   return (
     <div style={CAM_S.overlay}>
@@ -2661,17 +2784,23 @@ function CamaraTelemetro({ origenGPS, zona, onMarcar, onCerrar }) {
 
       <div style={CAM_S.panel}>
         {!origenGPS && <div>Esperando GPS…</div>}
+        {origenGPS && !lectura && <div>Esperando lectura de sensores…</div>}
         {origenGPS && lectura && (
           <>
-            <div style={CAM_S.fila}><span>Azimut</span><b>{lectura.az.toFixed(1)}°</b></div>
-            <div style={CAM_S.fila}><span>Inclinación</span><b>{lectura.inc.toFixed(1)}°</b></div>
+            {fila('Azimut', `${lectura.az.toFixed(1)}°`)}
+            {fila('Inclinación', `${lectura.inc.toFixed(1)}°`)}
             {lectura.ok ? (
               <>
-                <div style={CAM_S.fila}><span>Pendiente</span><b>{lectura.pendientePct.toFixed(0)}%</b></div>
-                <div style={CAM_S.fila}><span>Dist. horizontal</span><b>{lectura.distanciaHorizontal.toFixed(0)} m</b></div>
-                <div style={CAM_S.fila}><span>Dist. vertical</span><b>{lectura.distanciaVertical.toFixed(0)} m</b></div>
-                <div style={CAM_S.fila}><span>Dist. inclinada</span><b>{lectura.distanciaInclinada.toFixed(0)} m</b></div>
-                <div style={CAM_S.fila}><span>Elevación</span><b>{lectura.elevacion.toFixed(0)} m</b></div>
+                {fila('Pendiente', lectura.pendientePct === null ? '—' : `${lectura.pendientePct.toFixed(0)}%`)}
+                {fila('Dist. horizontal', `${lectura.distanciaHorizontal.toFixed(0)} m`)}
+                {fila('Dist. vertical', `${lectura.distanciaVertical.toFixed(0)} m`)}
+                {fila('Dist. inclinada', `${lectura.distanciaInclinada.toFixed(0)} m`)}
+                {fila('Elevación', `${lectura.elevacion.toFixed(0)} m`)}
+                <div style={{fontSize:11, opacity:.75, marginTop:4}}>
+                  Origen {lectura.z0.toFixed(0)} m ({lectura.fuenteZ0 === 'dem' ? 'DEM' : 'GPS'})
+                  {origenGPS.accuracy != null && ` · ±${origenGPS.accuracy.toFixed(0)} m`}
+                  {nMarcados > 0 && ` · ${nMarcados} marcado${nMarcados > 1 ? 's' : ''}`}
+                </div>
               </>
             ) : (
               <div style={{color:'#fca5a5', marginTop:4}}>{motivoTexto[lectura.motivo] || 'Sin lectura'}</div>
@@ -2681,7 +2810,12 @@ function CamaraTelemetro({ origenGPS, zona, onMarcar, onCerrar }) {
       </div>
 
       {camError && <div style={CAM_S.banner}>{camError}</div>}
-      {orient.error && !usarManual && <div style={CAM_S.banner}>{orient.error}</div>}
+      {!camError && !vertical && (
+        <div style={CAM_S.aviso}>Sostén el teléfono vertical: la inclinación solo es válida en esa posición.</div>
+      )}
+      {!camError && vertical && orient.disponible && !orient.absoluta && (
+        <div style={CAM_S.aviso}>Brújula sin norte absoluto: gira el teléfono en forma de 8 para calibrar.</div>
+      )}
 
       {usarManual && (
         <div style={CAM_S.manual}>
@@ -2692,30 +2826,47 @@ function CamaraTelemetro({ origenGPS, zona, onMarcar, onCerrar }) {
         </div>
       )}
 
-      <button type="button" onClick={marcar} disabled={!lectura?.ok} style={{
-        ...CAM_S.btnMarcar, opacity: lectura?.ok ? 1 : 0.4
+      <button type="button" onClick={marcar} disabled={!lectura || !lectura.ok} style={{
+        ...CAM_S.btnMarcar, opacity: (lectura && lectura.ok) ? 1 : 0.4
       }}>◎</button>
     </div>
   );
 }
 
-function TabTelemetro({ map, demInfo }) {
+// puntos/setPuntos/layersRef viven en App: si fueran estado local, cambiar de pestaña
+// desmontaría el tab y se perderían los puntos medidos en terreno (con sus marcadores
+// huérfanos ya dibujados en el mapa y sin forma de borrarlos).
+function TabTelemetro({ map, demInfo, puntos, setPuntos, layersRef }) {
   const [zona, setZona] = useState('19S');
+  const [zonaManual, setZonaManual] = useState(false);
   const [camaraAbierta, setCamaraAbierta] = useState(false);
-  const [puntos, setPuntos] = useState([]);
-  const { pos, error: errGeo } = useGeolocacionViva();
-  const layersRef = useRef({});
+  const { pos, error: errGeo, obsoleto } = useGeolocacionViva();
+  const orient = useOrientation();
 
-  const gpsPerdido = pos && (Date.now() - pos.ts > 8000);
+  // La zona UTM se deduce del GPS mientras el usuario no la fije a mano: en terreno es
+  // fácil quedarse con la zona por defecto y meter una distorsión de proyección gratis.
+  useEffect(() => {
+    if (!pos || zonaManual) return;
+    const z = zonaUTMDesdeLon(pos.lon);
+    if (z && z !== zona) setZona(z);
+  }, [pos, zonaManual, zona]);
+
+  const abrirCamara = async () => {
+    await orient.solicitarPermiso();   // iOS exige que salga del gesto del usuario
+    setCamaraAbierta(true);
+  };
 
   const agregarPunto = (lectura) => {
     const id = Date.now();
     const color = COLORES[puntos.length % COLORES.length];
+    // Dibujar el marcador fuera del updater de estado: los updaters deben ser puros
+    // (React puede invocarlos más de una vez y quedarían marcadores duplicados sin registrar).
     const marker = L.circleMarker([lectura.lat, lectura.lon], {
       radius: 6, color: '#fff', fillColor: color, fillOpacity: 1, weight: 2
-    }).bindTooltip(`Az ${lectura.az.toFixed(0)}° / Inc ${lectura.inc.toFixed(0)}°`).addTo(map.current);
+    }).bindTooltip(`Az ${lectura.az.toFixed(0)}° / ${lectura.distanciaHorizontal.toFixed(0)} m`)
+      .addTo(map.current);
     layersRef.current[id] = marker;
-    setPuntos(prev => [...prev, { id, color, ...lectura }]);
+    setPuntos(prev => [...prev, { id, color, zona, ...lectura }]);
   };
 
   const eliminar = (id) => {
@@ -2725,34 +2876,46 @@ function TabTelemetro({ map, demInfo }) {
     setPuntos(prev => prev.filter(p => p.id !== id));
   };
 
-  if (!demInfo) {
-    return <div style={LS.error}>Activa un DEM local arriba (descarga por área o GeoTIFF propio) para usar el telémetro.</div>;
-  }
-
   return (
     <div>
-      <label style={LS.label}>
-        Zona UTM
-        <select value={zona} onChange={e => setZona(e.target.value)} style={LS.input}>
-          <option>18S</option><option>19S</option><option>20S</option>
-        </select>
-      </label>
+      {!demInfo ? (
+        <div style={LS.error}>
+          Activa un DEM local arriba (descarga por área o GeoTIFF propio) para usar el telémetro.
+        </div>
+      ) : (
+        <>
+          <label style={LS.label}>
+            Zona UTM {!zonaManual && <span style={{fontSize:10, color:'#888'}}>(según GPS)</span>}
+            <select value={zona} onChange={e => { setZonaManual(true); setZona(e.target.value); }}
+              style={LS.input}>
+              <option>18S</option><option>19S</option><option>20S</option>
+            </select>
+          </label>
 
-      {errGeo && <div style={LS.error}>{errGeo}</div>}
-      {!errGeo && gpsPerdido && <div style={LS.error}>Señal GPS perdida hace {Math.round((Date.now()-pos.ts)/1000)} s.</div>}
+          {errGeo && <div style={LS.error}>{errGeo}</div>}
+          {!errGeo && obsoleto && <div style={LS.error}>Señal GPS perdida (sin fix reciente).</div>}
+          {!errGeo && !pos && <div style={{fontSize:12, color:'#666', marginTop:8}}>Esperando GPS…</div>}
+          {pos && !obsoleto && (
+            <div style={{fontSize:11, color:'#16a34a', marginTop:8}}>
+              ✓ GPS ±{pos.accuracy != null ? pos.accuracy.toFixed(0) : '?'} m
+            </div>
+          )}
 
-      <button type="button" onClick={() => setCamaraAbierta(true)} disabled={!pos || gpsPerdido}
-        style={LS.btn}>
-        📷 Iniciar telémetro
-      </button>
+          <button type="button" onClick={abrirCamara} disabled={!pos || obsoleto} style={LS.btn}>
+            📷 Iniciar telémetro
+          </button>
 
-      {camaraAbierta && (
-        <CamaraTelemetro
-          origenGPS={pos}
-          zona={zona}
-          onMarcar={agregarPunto}
-          onCerrar={() => setCamaraAbierta(false)}
-        />
+          {camaraAbierta && (
+            <CamaraTelemetro
+              origenGPS={pos}
+              zona={zona}
+              orient={orient}
+              nMarcados={puntos.length}
+              onMarcar={agregarPunto}
+              onCerrar={() => setCamaraAbierta(false)}
+            />
+          )}
+        </>
       )}
 
       {puntos.length > 0 && (
@@ -2766,7 +2929,8 @@ function TabTelemetro({ map, demInfo }) {
               <button type="button" onClick={() => eliminar(p.id)} style={LS.iconBtn} title="Eliminar">✕</button>
             </div>
           ))}
-          <button type="button" onClick={() => exportarKMZTelemetro(puntos)} style={{...LS.btn, marginTop:8, background:'#16a34a'}}>
+          <button type="button" onClick={() => exportarKMZTelemetro(puntos)}
+            style={{...LS.btn, marginTop:8, background:'#16a34a'}}>
             Exportar KMZ
           </button>
         </div>
