@@ -1073,27 +1073,61 @@ function offsetLatLon(lat, lon, zona, dE, dN) {
 // Open-Meteo Elevation API (Copernicus DEM GLO-90, ~90 m, global, sin key, con CORS).
 // Open Topo Data NO envía cabeceras CORS, así que no sirve desde el navegador.
 // points: [{lat, lon}, ...] — máx 100 por request.
-// Reintenta con backoff ante un 429 (rate limit: 600/min, 5000/h, 10000/día).
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-// Open-Meteo: 600 req/min, 5 000 req/h. Backoff exponencial ante 429.
-// Si persiste → mensaje orientando al botón de descarga de DEM.
+
+// Límites del plan gratuito: 600 req/min, 5 000/h, 10 000/día, contados POR DIRECCIÓN IP
+// (una petición HTTP = una llamada, sin importar cuántas coordenadas lleve). En una red
+// institucional detrás de NAT el cupo se comparte con todos los equipos que salgan por la
+// misma IP, así que se puede recibir un 429 sin haber consultado casi nada. Por eso la
+// salida real no es "reintentar más lento" sino trabajar contra un DEM local.
+const OM_LOTE = 100;   // coordenadas por petición (máximo que acepta la API)
+const MSG_LIMITE_API =
+  'Límite de Open-Meteo alcanzado. El cupo es por dirección IP y se comparte con toda la red, ' +
+  'así que puede agotarse aunque tú hayas consultado poco. Descarga el DEM del área: el ' +
+  'cálculo pasa a ser local, instantáneo y sin límite.';
+
+// Tras un 429 definitivo no tiene sentido que la siguiente acción del usuario vuelva a gastar
+// 65 s de backoff para llegar al mismo error: se marca un enfriamiento y se falla de inmediato.
+let apiBloqueadaHasta = 0;
+const apiEnEnfriamiento = () => Date.now() < apiBloqueadaHasta;
+
+// Caché de elevaciones ya consultadas. Clave a 5 decimales (~1 m): las grillas de muestreo son
+// deterministas, así que recalcular el mismo plano cambiando solo el manteo acierta el 100 % de
+// la caché y no gasta ni una petición.
+const cacheElev = new Map();
+const CACHE_MAX  = 200000;
+const claveElev  = (lat, lon) => lat.toFixed(5) + ',' + lon.toFixed(5);
+
+function guardarEnCache(lat, lon, elev) {
+  if (cacheElev.size >= CACHE_MAX) cacheElev.clear();  // tope simple: vaciar antes que crecer sin fin
+  cacheElev.set(claveElev(lat, lon), elev);
+}
+
 async function queryElevaciones(points, intento = 0) {
   if (points.length === 0) return [];
+  if (apiEnEnfriamiento()) throw new Error(MSG_LIMITE_API);
   const lats = points.map(p => p.lat.toFixed(6)).join(',');
   const lons = points.map(p => p.lon.toFixed(6)).join(',');
   const url  = `https://api.open-meteo.com/v1/elevation?latitude=${lats}&longitude=${lons}`;
   const resp = await fetch(url);
   if (resp.status === 429) {
     if (intento < 3) {
-      await sleep([5000, 15000, 45000][intento]);
+      // Retry-After, si viene, es la única información real de cuándo se libera el cupo.
+      const ra = parseInt(resp.headers.get('Retry-After') || '', 10);
+      await sleep(Number.isFinite(ra) ? Math.min(ra * 1000, 60000) : [5000, 15000, 45000][intento]);
       return queryElevaciones(points, intento + 1);
     }
-    throw new Error('Límite de Open-Meteo alcanzado. Usa "⬇ Descargar DEM de un área" para evitar este problema.');
+    apiBloqueadaHasta = Date.now() + 60000;
+    throw new Error(MSG_LIMITE_API);
   }
   if (!resp.ok) throw new Error(`Open-Meteo: HTTP ${resp.status}`);
   const data = await resp.json();
   if (!Array.isArray(data.elevation)) throw new Error('Open-Meteo: respuesta sin elevaciones');
-  return points.map((p, i) => ({ ...p, elevation: data.elevation[i] ?? 0 }));
+  return points.map((p, i) => {
+    const elevation = data.elevation[i] ?? 0;
+    guardarEnCache(p.lat, p.lon, elevation);
+    return { ...p, elevation };
+  });
 }
 
 function chunk(arr, n) {
@@ -1103,14 +1137,52 @@ function chunk(arr, n) {
 }
 
 async function getElevaciones(points) {
-  const batches = chunk(points, 100);
+  // Resolver primero por caché: solo los puntos nuevos gastan cupo de la API.
+  const out = new Array(points.length);
+  const faltan = [], idxFaltan = [];
+  points.forEach((p, i) => {
+    const c = cacheElev.get(claveElev(p.lat, p.lon));
+    if (c !== undefined) out[i] = { ...p, elevation: c };
+    else { faltan.push(p); idxFaltan.push(i); }
+  });
+  if (faltan.length === 0) return out;
+
+  const batches = chunk(faltan, OM_LOTE);
   const results = [];
   for (let b = 0; b < batches.length; b++) {
     if (b > 0) await sleep(500); // 500 ms entre lotes → ~120 req/min, bien bajo el límite
     const res = await queryElevaciones(batches[b]);
     results.push(...res);
   }
-  return results;
+  idxFaltan.forEach((idx, j) => { out[idx] = results[j]; });
+  return out;
+}
+
+// Cuántos puntos tendría que preguntarle a Open-Meteo: los que no cubre el DEM local ni la
+// caché. Sirve para avisar ANTES de disparar una tanda grande de peticiones.
+async function contarPuntosAPI(points) {
+  let n = 0;
+  for (const p of points) {
+    if (cacheElev.has(claveElev(p.lat, p.lon))) continue;
+    if (localDEM && (await elevacionLocal(p.lat, p.lon)) !== null) continue;
+    n++;
+  }
+  return n;
+}
+
+// Rectángulo que cubre los puntos, con margen, para bajar el DEM del área justa.
+function bboxDePuntos(points, margenM = 600) {
+  let minLat =  90, maxLat = -90, minLon =  180, maxLon = -180;
+  for (const p of points) {
+    if (p.lat < minLat) minLat = p.lat;
+    if (p.lat > maxLat) maxLat = p.lat;
+    if (p.lon < minLon) minLon = p.lon;
+    if (p.lon > maxLon) maxLon = p.lon;
+  }
+  const dLat = margenM / 110540;
+  const dLon = margenM / (111320 * Math.max(0.2, Math.cos(toRad((minLat + maxLat) / 2))));
+  return { minLat: minLat - dLat, maxLat: maxLat + dLat,
+           minLon: minLon - dLon, maxLon: maxLon + dLon };
 }
 
 // localDEM = { rasters:Float32Array, width, height, crs, bbox:{minX,minY,maxX,maxY en unidades del CRS}, nombre }
@@ -1151,8 +1223,10 @@ async function elevacionLocal(lat, lon) {
   const { crs, bbox, width, height, rasters } = localDEM;
   const [X, Y] = aCRS(lat, lon, crs);
   if (X < bbox.minX || X > bbox.maxX || Y < bbox.minY || Y > bbox.maxY) return null;
-  const col = Math.floor((X - bbox.minX) / (bbox.maxX - bbox.minX) * width);
-  const row = Math.floor((bbox.maxY - Y) / (bbox.maxY - bbox.minY) * height);
+  // Clamp: justo en el borde (X === maxX, Y === minY) el índice se pasa en uno y leería el
+  // primer píxel de la fila siguiente —un valor de otro sitio— o undefined en la última fila.
+  const col = Math.min(width  - 1, Math.max(0, Math.floor((X - bbox.minX) / (bbox.maxX - bbox.minX) * width)));
+  const row = Math.min(height - 1, Math.max(0, Math.floor((bbox.maxY - Y) / (bbox.maxY - bbox.minY) * height)));
   const val = rasters[row * width + col];
   return (val === undefined || val < -9000) ? null : val;
 }
@@ -1195,11 +1269,15 @@ async function descargarDEMArea(bounds, onProgress) {
     minY:  MERC_EXTENT - (yMax + 1) * tileM,
   };
 
-  let hechos = 0;
+  let hechos = 0, fallidos = 0;
   for (let ty = yMin; ty <= yMax; ty++) {
     for (let tx = xMin; tx <= xMax; tx++) {
       try {
-        const ab  = await (await fetch(`${TERRAIN_TILES}/${z}/${tx}/${ty}.tif`)).arrayBuffer();
+        const resp = await fetch(`${TERRAIN_TILES}/${z}/${tx}/${ty}.tif`);
+        // Sin este chequeo un 403/500 se tragaba igual que un tile inexistente y el trozo
+        // quedaba en 0 m: un DEM "a nivel del mar" en plena cordillera, sin avisar.
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const ab  = await resp.arrayBuffer();
         const img = await (await GeoTIFF.fromArrayBuffer(ab)).getImage();
         const data = (await img.readRasters())[0];
         const tw = img.getWidth(), th = img.getHeight();
@@ -1207,17 +1285,25 @@ async function descargarDEMArea(bounds, onProgress) {
         for (let r = 0; r < th; r++)
           for (let c = 0; c < tw; c++)
             mosaico[(oy + r) * W + (ox + c)] = data[r * tw + c];
-      } catch (e) { /* tile faltante (océano/borde): queda en 0 */ }
+      } catch (e) { fallidos++; }
       hechos++;
       if (onProgress) onProgress(hechos, total);
     }
   }
-  return { rasters: mosaico, width: W, height: H, crs: 'EPSG:3857', bbox };
+  if (fallidos === total)
+    throw new Error('No se pudo descargar ningún tile del DEM (¿sin conexión?).');
+  return { rasters: mosaico, width: W, height: H, crs: 'EPSG:3857', bbox,
+           tilesFallidos: fallidos, tilesTotal: total };
 }
 
 // Activa el DEM descargado como fuente prioritaria de elevación
 function activarDEM(dem, nombre) {
   localDEM = { ...dem, nombre };
+}
+
+function avisoTilesFallidos(dem) {
+  return `Atención: ${dem.tilesFallidos} de ${dem.tilesTotal} tiles no se pudieron descargar. ` +
+         'Esas zonas quedaron en 0 m y las trazas que las crucen serán incorrectas.';
 }
 
 // Guarda el DEM (mosaico) como GeoTIFF EPSG:3857 descargable
@@ -1596,6 +1682,7 @@ function DEMControls({ map, demInfo, setDemInfo }) {
         const dem = await descargarDEMArea(bounds, (h, t) => setProg({ hechos: h, total: t }));
         activarDEM(dem, 'Área descargada (~19 m)');
         setDemInfo({ nombre: 'Área descargada (~19 m)', fuente: 'area' });
+        if (dem.tilesFallidos) setError(avisoTilesFallidos(dem));
       } catch (e) { setError(e.message); }
       finally { setModo('idle'); setProg(null); }
     });
@@ -1812,7 +1899,13 @@ const LS = {
              background:'#fff', borderRadius:4, marginBottom:4,
              boxShadow:'0 1px 2px rgba(0,0,0,.08)' },
   iconBtn: { background:'none', border:'none', cursor:'pointer', fontSize:15, padding:'0 2px' },
+  avisoAPI: { background:'#fff7ed', border:'1.5px solid #d97706', color:'#7c2d12',
+              padding:'8px 10px', borderRadius:6, fontSize:12, marginTop:8 },
 };
+
+// Sobre este número de elevaciones nuevas conviene bajar el DEM en vez de consultar en línea:
+// una traza de 2 000 m (el valor por defecto) son ~375 puntos y no dispara el aviso.
+const UMBRAL_AVISO_API = 500;
 
 function TabPuntuales({ map, externalInput, demInfo, setDemInfo }) {
   const [zona,    setZona]    = useState('19S');
@@ -1825,6 +1918,8 @@ function TabPuntuales({ map, externalInput, demInfo, setDemInfo }) {
   const [planos,  setPlanos]  = useState([]);
   const [loading, setLoading] = useState(false);
   const [error,   setError]   = useState('');
+  const [aviso,   setAviso]   = useState(null);   // { plan, nAPI, bloqueada, bounds }
+  const [demProg, setDemProg] = useState(null);
   const layersRef    = useRef({});
   const calculandoRef = useRef(false);
 
@@ -1851,26 +1946,54 @@ function TabPuntuales({ map, externalInput, demInfo, setDemInfo }) {
     return () => m.off('click', onClick);
   }, [zona, map]);
 
-  const calcular = async () => {
-    if (calculandoRef.current) return;
-    setError('');
+  // El aviso lleva dentro la grilla ya calculada: si el usuario edita el formulario deja de
+  // corresponder, y "Consultar igual" trazaría con los valores viejos. Se descarta y se
+  // vuelve a evaluar en el próximo "Calcular traza".
+  useEffect(() => { setAviso(null); }, [zona, easting, northing, rumbo, manteo, longitud]);
+
+  // Valida el formulario y arma la grilla de muestreo, sin tocar la red todavía: así se
+  // puede estimar el gasto de API antes de disparar una tanda grande de peticiones.
+  const prepararPlan = () => {
     const E0 = parseFloat(easting), N0 = parseFloat(northing);
     const ru = parseFloat(rumbo),   ma = parseFloat(manteo);
     const largo = parseFloat(longitud);
-    if ([E0,N0,ru,ma,largo].some(isNaN)) { setError('Completa todos los campos numéricos.'); return; }
-    if (ru < 0 || ru > 360) { setError('Rumbo debe estar entre 0° y 360°.'); return; }
-    if (ma < 0 || ma >= 90) { setError('Manteo debe estar entre 0° y 89°.'); return; }
-    if (largo > 10000)      { setError('Longitud máxima 10 000 m (usa DEM local para áreas grandes).'); return; }
-    if (!nombre.trim())     { setError('Ingresa un nombre.'); return; }
+    if ([E0,N0,ru,ma,largo].some(isNaN)) { setError('Completa todos los campos numéricos.'); return null; }
+    if (ru < 0 || ru > 360) { setError('Rumbo debe estar entre 0° y 360°.'); return null; }
+    if (ma < 0 || ma >= 90) { setError('Manteo debe estar entre 0° y 89°.'); return null; }
+    if (largo > 10000)      { setError('Longitud máxima 10 000 m (usa DEM local para áreas grandes).'); return null; }
+    if (!nombre.trim())     { setError('Ingresa un nombre.'); return null; }
+    const { lat: lat0, lon: lon0 } = utmToLatLon(E0, N0, zona);
+    return { E0, N0, ru, ma, largo, lat0, lon0,
+             grilla: grillaMuestreo(E0, N0, zona, ru, largo) };
+  };
 
+  const calcular = async () => {
+    if (calculandoRef.current) return;
+    setError(''); setAviso(null);
+    const plan = prepararPlan();
+    if (!plan) return;
+    // Aviso proactivo: si la traza necesita muchas consultas —o la API ya está en
+    // enfriamiento por un 429— ofrecer bajar el DEM del área en vez de saturar Open-Meteo.
+    const nAPI = await contarPuntosAPI([{ lat: plan.lat0, lon: plan.lon0 }, ...plan.grilla.points]);
+    if (nAPI > 0 && (nAPI > UMBRAL_AVISO_API || apiEnEnfriamiento())) {
+      setAviso({ plan, nAPI, bloqueada: apiEnEnfriamiento(),
+                 bounds: bboxDePuntos([{ lat: plan.lat0, lon: plan.lon0 }, ...plan.grilla.points]) });
+      return;
+    }
+    ejecutar(plan);
+  };
+
+  // avisoPrevio: mensaje que debe sobrevivir al cálculo (ej. tiles de DEM que fallaron);
+  // si no se pasa, el cálculo parte con el panel de errores limpio.
+  const ejecutar = async ({ E0, N0, ru, ma, largo, lat0, lon0, grilla }, avisoPrevio = '') => {
+    if (calculandoRef.current) return;
+    setError(avisoPrevio); setAviso(null);
     calculandoRef.current = true;
     setLoading(true);
     try {
-      const { lat: lat0, lon: lon0 } = utmToLatLon(E0, N0, zona);
       const [centro] = await getElevacionesMixta([{ lat: lat0, lon: lon0 }]);
       const z0 = centro.elevation;
 
-      const grilla = grillaMuestreo(E0, N0, zona, ru, largo);
       const conElev = await getElevacionesMixta(grilla.points);
       const traza = extraerTraza(conElev, grilla.nLong, grilla.nPerp, z0, ru, ma);
       const corners = cornersPlano3D(E0, N0, z0, zona, ru, ma, largo);
@@ -1907,6 +2030,24 @@ function TabPuntuales({ map, externalInput, demInfo, setDemInfo }) {
     } finally {
       calculandoRef.current = false;
       setLoading(false);
+    }
+  };
+
+  // Baja el DEM del área justa de la traza (sin pedirle al usuario que dibuje el rectángulo)
+  // y encadena el cálculo: a partir de aquí todo se resuelve local, sin tocar Open-Meteo.
+  const descargarDEMYCalcular = async (av) => {
+    setError('');
+    setDemProg({ hechos: 0, total: 0 });
+    try {
+      const dem = await descargarDEMArea(av.bounds, (h, t) => setDemProg({ hechos: h, total: t }));
+      activarDEM(dem, 'Área de la traza (~19 m)');
+      setDemInfo({ nombre: 'Área de la traza (~19 m)', fuente: 'area' });
+      setAviso(null);
+      setDemProg(null);
+      await ejecutar(av.plan, dem.tilesFallidos ? avisoTilesFallidos(dem) : '');
+    } catch (e) {
+      setDemProg(null);
+      setError('No se pudo descargar el DEM: ' + e.message);
     }
   };
 
@@ -1963,6 +2104,38 @@ function TabPuntuales({ map, externalInput, demInfo, setDemInfo }) {
       </label>
 
       {error && <div style={LS.error}>{error}</div>}
+
+      {aviso && (
+        <div style={LS.avisoAPI}>
+          <div style={{fontWeight:700, marginBottom:4}}>
+            {aviso.bloqueada ? '⛔ Open-Meteo sin cupo' : '⚠ Traza grande para consultar en línea'}
+          </div>
+          <div style={{marginBottom:8}}>
+            {aviso.bloqueada
+              ? 'La API rechazó las últimas consultas (el cupo es por IP y se comparte con toda la red). '
+              : `Esta traza necesita ${aviso.nAPI.toLocaleString('es-CL')} elevaciones ` +
+                `(${Math.ceil(aviso.nAPI / OM_LOTE)} peticiones, ~${Math.ceil(aviso.nAPI / OM_LOTE * 0.7)} s) a Open-Meteo. `}
+            Descarga el DEM de esta zona y el cálculo será local, instantáneo y reutilizable.
+          </div>
+          {demProg ? (
+            <div style={{fontSize:12, color:'#555'}}>
+              Descargando DEM… {demProg.total ? `${demProg.hechos}/${demProg.total} tiles` : ''}
+            </div>
+          ) : (
+            <div style={{display:'flex', gap:6}}>
+              <button type="button" onClick={() => descargarDEMYCalcular(aviso)}
+                style={{...LS.btn, marginTop:0, background:'#0891b2', fontSize:12, flex:2}}>
+                ⬇ Descargar DEM de esta traza
+              </button>
+              <button type="button" onClick={() => ejecutar(aviso.plan)} disabled={aviso.bloqueada}
+                style={{...LS.btn, marginTop:0, background:'#6b7280', fontSize:12, flex:1,
+                        opacity: aviso.bloqueada ? 0.5 : 1}}>
+                Consultar igual
+              </button>
+            </div>
+          )}
+        </div>
+      )}
 
       <button type="button" onClick={calcular} disabled={loading} style={LS.btn}>
         {loading ? 'Calculando…' : 'Calcular traza'}
@@ -2116,31 +2289,77 @@ function ajustarPlano(puntos3D) {
 
 // ── Análisis de pliegue (π-diagrama) ──────────────────────────
 
+// Vector unitario de una línea dada por azimut y buzamiento (apuntando hacia abajo).
+function ejeDesdeAzBuz(azDeg, buzDeg) {
+  const a = toRad(azDeg), b = toRad(buzDeg);
+  return [Math.sin(a)*Math.cos(b), Math.cos(a)*Math.cos(b), -Math.sin(b)];
+}
+
+// Ángulos (0-90°) entre cada polo y un eje. Son datos axiales: el signo del polo da igual,
+// por eso el valor absoluto del producto punto.
+function angulosPoloEje(normales, eje) {
+  return normales.map(n => toDeg(Math.acos(Math.min(1,
+    Math.abs(n[0]*eje[0] + n[1]*eje[1] + n[2]*eje[2])))));
+}
+
+function rmsDesde(valores, centro) {
+  return Math.sqrt(valores.reduce((s, v) => s + (v - centro) * (v - centro), 0) / valores.length);
+}
+
+// Ajuste de CÍRCULO MENOR (pliegue cónico): busca el eje â y el semiángulo α que minimizan
+// Σ(θᵢ − α)². El caso α = 90° es el gran círculo (cilíndrico), pero aquí el eje NO puede salir
+// de un eigenvector: para un cono los polos forman un círculo menor y el eigenvector menor
+// apunta a otra parte. Hay que buscarlo — barrido grueso sobre el hemisferio y refinamiento.
+function ajusteCirculoMenor(normales) {
+  const evaluar = (az, buz) => {
+    const ang  = angulosPoloEje(normales, ejeDesdeAzBuz(az, buz));
+    const alfa = ang.reduce((s, v) => s + v, 0) / ang.length;   // el óptimo de α es la media
+    return { az, buz, alfa, rms: rmsDesde(ang, alfa) };
+  };
+  let mejor = { rms: Infinity };
+  // El eje se reporta buzando, así que basta el hemisferio inferior (buz 0-90°).
+  for (let az = 0; az < 360; az += 5)
+    for (let buz = 0; buz <= 90; buz += 5) {
+      const c = evaluar(az, buz);
+      if (c.rms < mejor.rms) mejor = c;
+    }
+  // Refinamiento por patrón: pasos cada vez más finos alrededor del mejor candidato.
+  for (let paso = 2.5; paso >= 0.05; paso /= 2) {
+    let mejoro = true;
+    while (mejoro) {
+      mejoro = false;
+      for (const [dAz, dBuz] of [[paso,0], [-paso,0], [0,paso], [0,-paso]]) {
+        const c = evaluar(mod360(mejor.az + dAz), Math.max(0, Math.min(90, mejor.buz + dBuz)));
+        if (c.rms < mejor.rms - 1e-9) { mejor = c; mejoro = true; }
+      }
+    }
+  }
+  return mejor;   // { az, buz, alfa, rms }
+}
+
+// AICc: compara modelos con distinto número de parámetros y penaliza el extra. Sin esto el
+// cónico gana siempre por tener un grado de libertad más. k incluye la varianza:
+// cilíndrico = eje(2) + varianza = 3; cónico = eje(2) + semiángulo(1) + varianza = 4.
+function aicc(rms, n, k) {
+  const rss = Math.max(rms * rms * n, 1e-9);
+  return n * Math.log(rss / n) + 2 * k + (2 * k * (k + 1)) / Math.max(1, n - k - 1);
+}
+
 function analizarPliegue(puntos3D) {
   const K = Math.max(3, Math.floor(puntos3D.length / 4));
   const segLen = Math.floor(puntos3D.length / K);
 
-  // Normales locales de cada segmento
+  // Polo local de cada segmento de la traza, por ajuste de plano.
+  // OJO: se probó descartar los segmentos con peor RMSE de ajuste (los que cruzan una
+  // charnela) y resultó CONTRAPRODUCENTE. Esos segmentos son justamente la señal de que el
+  // pliegue no es cilíndrico: al filtrarlos, el cono sintético bajaba su RMSE de 13.9° a 7.8°
+  // y pasaba el umbral de aviso, quedando un eje equivocado sin ninguna advertencia.
   const normales = [];
   for (let i = 0; i < K; i++) {
     const seg = puntos3D.slice(i * segLen, (i + 1) * segLen + 1);
     if (seg.length < 3) continue;
-    // Vector tangente promedio del segmento
-    const mid = Math.floor(seg.length / 2);
-    const a   = seg[Math.max(0, mid - 1)];
-    const b   = seg[Math.min(seg.length - 1, mid + 1)];
-    const t   = { E: b.E - a.E, N: b.N - a.N, Z: b.Z - a.Z };
-    const tLen = Math.sqrt(t.E*t.E + t.N*t.N + t.Z*t.Z);
-    if (tLen < 1e-6) continue;
-    t.E /= tLen; t.N /= tLen; t.Z /= tLen;
-    // Normal local al segmento: usar ajustarPlano sobre el segmento
-    if (seg.length >= 3) {
-      const fit = ajustarPlano(seg);
-      normales.push(fit.normal);
-    }
+    normales.push(ajustarPlano(seg).normal);
   }
-
-  if (normales.length < 3) return null;
 
   // Ajuste de gran círculo (pliegue cilíndrico):
   // Eje del pliegue = eigenvector del valor propio MÍNIMO de la covarianza de las normales
@@ -2158,43 +2377,42 @@ function analizarPliegue(puntos3D) {
   const axLen = Math.sqrt(axE*axE + axN*axN + axZ*axZ);
   axE/=axLen; axN/=axLen; axZ/=axLen;
 
-  // Asegurar que el eje apunte hacia arriba o hacia el norte (azimut < 180)
-  const azEje = mod360(toDeg(Math.atan2(axE, axN)));
-  if (azEje > 180) { axE=-axE; axN=-axN; axZ=-axZ; }
+  // Un eje es un dato axial: el eigenvector sirve igual con signo invertido. La convención
+  // geológica reporta el extremo que BUZA (hacia abajo), así que se orienta con axZ ≤ 0 y de
+  // ahí salen directamente azimut = atan2(E,N) y buzamiento = asin(-Z).
+  if (axZ > 0) { axE=-axE; axN=-axN; axZ=-axZ; }
 
-  // RMSE cilíndrico: ángulo entre cada normal y el eje (debe ser ~90°)
-  const rmseCil = Math.sqrt(
-    normales.reduce((s, [nE,nNv,nZ]) => {
-      const dot = Math.abs(nE*axE + nNv*axN + nZ*axZ);
-      const ang = toDeg(Math.acos(Math.min(1, dot)));
-      return s + (ang - 90) * (ang - 90);
-    }, 0) / nN
-  );
+  // ── Modelo cilíndrico: gran círculo, eje = eigenvector menor, semiángulo fijo en 90° ──
+  const azCil  = mod360(toDeg(Math.atan2(axE, axN)));
+  const buzCil = toDeg(Math.asin(Math.min(1, Math.abs(axZ))));
+  const rmseCil = rmsDesde(angulosPoloEje(normales, [axE, axN, axZ]), 90);
 
-  // Ajuste de pequeño círculo (pliegue cónico):
-  // semiángulo = media del ángulo entre cada normal y el eje
-  const angulos = normales.map(([nE,nNv,nZ]) => {
-    const dot = Math.abs(nE*axE + nNv*axN + nZ*axZ);
-    return toDeg(Math.acos(Math.min(1, dot)));
-  });
-  const semiangulo = angulos.reduce((s,a) => s+a, 0) / nN;
-  const rmseCon = Math.sqrt(
-    angulos.reduce((s,a) => s + (a - semiangulo)*(a - semiangulo), 0) / nN
-  );
+  // ── Modelo cónico: círculo menor, eje y semiángulo resueltos a la vez ──
+  // Se calcula, pero NO se adopta como resultado. Motivo medido sobre pliegues sintéticos:
+  // los polos que salen de ajustar planos a segmentos de una traza 1D no son polos de
+  // estratificación, sino normales del plano osculador de la curva, y arrastran un error que
+  // depende del recorrido que dibuje la topografía: −7° con ±3.8° de dispersión sobre un
+  // cilindro PERFECTO, invariante al largo del segmento (probado de 3 a 20 puntos). Ese error
+  // es del mismo tamaño que la diferencia cilindro/cono, así que el AICc etiquetaría "cónico"
+  // un cilindro perfecto. Y con cobertura azimutal parcial el eje del cono ni siquiera es
+  // identificable: en un cono sintético (eje 315/30) el óptimo cayó en 181/4 con MEJOR RMS
+  // (4.19 vs 11.34) que el eje verdadero. El eje π, en cambio, sí sale exacto: 315.3/29.7.
+  // Para clasificar cono vs cilindro con fundamento harían falta actitudes medidas en terreno,
+  // no polos deducidos de la traza.
+  const con = ajusteCirculoMenor(normales);
 
-  const esCilindrico = rmseCil <= rmseCon;
-  const azEjeFinal = mod360(toDeg(Math.atan2(Math.abs(axE), Math.abs(axN))));
-  const buzEje     = toDeg(Math.acos(Math.min(1, Math.abs(axZ))));
-
+  const r1 = x => Math.round(x * 10) / 10;
+  const r2 = x => Math.round(x * 100) / 100;
   return {
-    tipo:        esCilindrico ? 'cilíndrico' : 'cónico',
-    azEje:       Math.round(azEjeFinal * 10) / 10,
-    buzEje:      Math.round(buzEje * 10) / 10,
-    semiangulo:  Math.round(semiangulo * 10) / 10,
-    rmseCil:     Math.round(rmseCil * 100) / 100,
-    rmseCon:     Math.round(rmseCon * 100) / 100,
-    rmseUsado:   Math.round((esCilindrico ? rmseCil : rmseCon) * 100) / 100,
-    nNormales:   nN,
+    azEje:      r1(azCil),          // siempre el eje π (gran círculo)
+    buzEje:     r1(buzCil),
+    cilindrico: rmseCil < 10,
+    rmseCil:    r2(rmseCil),
+    rmseUsado:  r2(rmseCil),
+    conico:     { az: r1(con.az), buz: r1(con.buz), semiangulo: r1(con.alfa), rms: r2(con.rms),
+                  // solo un indicio: ver el comentario de arriba antes de creerle
+                  mejorAICc: aicc(con.rms, nN, 4) < aicc(rmseCil, nN, 3) },
+    nNormales:  nN,
   };
 }
 
@@ -2283,21 +2501,38 @@ function ResultadoOrientacion({ resultado, zona, puntos, onUsarEnTab1 }) {
   }
 
   const color = calidadColor(pliegue.rmseUsado, 5, 15);
-  const esCil = pliegue.tipo === 'cilíndrico';
   return (
     <div style={{marginTop:12, padding:10, background:'#faf5ff', borderRadius:6, border:`1.5px solid ${color}`}}>
       <div style={{fontWeight:700, color:'#7c3aed', marginBottom:8}}>
-        ⟳ Pliegue {pliegue.tipo}
+        ⟳ Pliegue — eje π {pliegue.cilindrico ? '(ajuste cilíndrico)' : '(ajuste pobre)'}
       </div>
       {badge('Eje — azimut', pliegue.azEje, '°')}
       {badge('Eje — buzamiento', pliegue.buzEje, '°')}
-      {!esCil && badge('Semiángulo del cono', pliegue.semiangulo, '°')}
       <div style={{display:'flex', justifyContent:'space-between', marginBottom:4}}>
         <span style={{color:'#555', fontSize:12}}>RMSE angular</span>
         <span style={{fontWeight:700, fontSize:13, color}}>{pliegue.rmseUsado} <span style={{color:'#888', fontSize:11}}>°</span></span>
       </div>
-      {badge('N normales usadas', pliegue.nNormales)}
+      {badge('Polos usados', pliegue.nNormales)}
       {badge('RMSE plano general', ajuste.rmse, 'm')}
+      {!pliegue.cilindrico && (
+        <div style={{fontSize:11, color:'#b45309', marginTop:6, fontWeight:600}}>
+          Los polos no caen bien en un gran círculo: ajuste dudoso.
+        </div>
+      )}
+      {/* El aviso va SIEMPRE, no atado a un umbral: sobre pliegues sintéticos los cilindros
+          dieron RMSE 6.8-8.2° y los conos 8.4-13.9° — rangos que se solapan, así que un cono
+          puede pasar por debajo de cualquier corte razonable con el eje muy equivocado. */}
+      <div style={{fontSize:11, color:'#6b7280', marginTop:6, borderTop:'1px dashed #ddd', paddingTop:6}}>
+        El eje supone un pliegue <b>cilíndrico</b>. Sobre pliegues sintéticos sale exacto (±1°)
+        cuando efectivamente lo es, pero si el pliegue es cónico puede errar decenas de grados
+        <i> sin que el RMSE lo delate</i>: los polos deducidos de una traza no son actitudes
+        medidas. Contrasta con mediciones de terreno antes de usarlo en un informe.
+        {pliegue.conico.mejorAICc && (
+          <> {' '}Además hay indicio de cono: un círculo menor de semiángulo{' '}
+          {pliegue.conico.semiangulo}° en torno a {pliegue.conico.az}°/{pliegue.conico.buz}°
+          ajusta mejor (RMS {pliegue.conico.rms}°), pero tampoco es concluyente.</>
+        )}
+      </div>
     </div>
   );
 }
@@ -2350,7 +2585,7 @@ async function exportarKMZLinea(puntos, resultado, zona) {
     </Placemark>`;
   } else if (resultado?.tipo === 'pliegue' && resultado.pliegue) {
     // ── 2b. Eje del pliegue como línea 3D ────────────────────────
-    const { azEje, buzEje, tipo, rmseUsado } = resultado.pliegue;
+    const { azEje, buzEje, cilindrico, rmseUsado } = resultado.pliegue;
     const centroide = resultado.ajuste.centroide;
     // Longitud del eje = longitud de la traza
     let d = 0;
@@ -2366,14 +2601,17 @@ async function exportarKMZLinea(puntos, resultado, zona) {
     const dN = Math.cos(azRad) * Math.cos(buzRad) * halfL;
     const dZ = -Math.sin(buzRad) * halfL;
 
+    // El eje baja HACIA su azimut: el extremo +dE/+dN (el que apunta al azimut) es el que
+    // queda más abajo. Tenerlo al revés dibujaba el eje buzando hacia el lado contrario.
     const p1 = utmToLatLon(centroide.E - dE, centroide.N - dN, zona);
     const p2 = utmToLatLon(centroide.E + dE, centroide.N + dN, zona);
-    const z1 = centroide.Z + dZ, z2 = centroide.Z - dZ;
+    const z1 = centroide.Z - dZ, z2 = centroide.Z + dZ;
 
     extraPlacemark = `
     <Placemark>
-      <name>Eje de pliegue ${tipo}</name>
-      <description>Azimut: ${azEje}° / Buzamiento: ${buzEje}°&#10;RMSE angular: ${rmseUsado}°</description>
+      <name>Eje de pliegue (π)</name>
+      <description>Azimut: ${azEje}° / Buzamiento: ${buzEje}°&#10;RMSE angular: ${rmseUsado}°${
+        cilindrico ? '' : '&#10;Ajuste cilíndrico pobre.'}&#10;Supone pliegue cilíndrico; si es cónico el eje puede errar mucho. Contrastar con actitudes medidas en terreno.</description>
       <Style>
         <LineStyle><color>aa7c3aed</color><width>3</width></LineStyle>
       </Style>
@@ -2544,6 +2782,14 @@ function TabLinea({ map, onUsarEnTab1 }) {
     m.on('click', onClick);
     return () => { m.off('click', onClick); m.getContainer().style.cursor = ''; };
   }, [modo, zona, map]);
+
+  // Cambiar la zona UTM con puntos ya marcados dejaba sus E/N calculados en la zona anterior:
+  // el ajuste de plano mezclaba dos sistemas de coordenadas y salía un rumbo/manteo inventado.
+  useEffect(() => {
+    setPuntos(prev => prev.length === 0 ? prev
+      : prev.map(p => ({ ...p, ...latLonToUtm(p.lat, p.lon, zona) })));
+    setResultado(prev => prev === null ? prev : null);
+  }, [zona]);
 
   const limpiar = () => {
     const m = map.current;
