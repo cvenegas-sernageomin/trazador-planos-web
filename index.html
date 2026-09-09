@@ -1218,7 +1218,10 @@ async function cargarDEMLocal(file) {
   return { nombre: file.name, crs };
 }
 
-async function elevacionLocal(lat, lon) {
+// Versión síncrona: el lookup es solo aritmética sobre un array ya en memoria, sin I/O.
+// La usa también el terrain provider de Cesium (Vista 3D), que hace miles de llamadas por
+// tile y no puede pagar el overhead de una promesa por cada una.
+function elevacionLocalSync(lat, lon) {
   if (!localDEM) return null;
   const { crs, bbox, width, height, rasters } = localDEM;
   const [X, Y] = aCRS(lat, lon, crs);
@@ -1229,6 +1232,10 @@ async function elevacionLocal(lat, lon) {
   const row = Math.min(height - 1, Math.max(0, Math.floor((bbox.maxY - Y) / (bbox.maxY - bbox.minY) * height)));
   const val = rasters[row * width + col];
   return (val === undefined || val < -9000) ? null : val;
+}
+
+async function elevacionLocal(lat, lon) {
+  return elevacionLocalSync(lat, lon);
 }
 
 // ── Descarga de DEM por área (AWS Terrain Tiles, Mapzen/Tilezen) ──────
@@ -1323,6 +1330,64 @@ async function guardarDEMtif(nombre) {
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob); a.download = nombre; a.click();
   URL.revokeObjectURL(a.href);
+}
+
+// ── Vista 3D (Cesium) sobre el DEM local activo ──────────────────
+// Leaflet es 2D: una foto satelital sobre un mapa plano, sin relieve real, lo que no sirve
+// para juzgar geometría en terreno (pendientes, líneas de visual). Cesium sí muestra el
+// relieve real, pero solo cuando hay un DEM local activo — no existe una fuente de terreno
+// mundial gratis sin cuenta/token (Cesium World Terrain exige uno). CustomHeightmapTerrainProvider
+// evita esa dependencia: genera la malla 3D muestreando el mismo `localDEM` que ya usan
+// `elevacionLocal` (Tabs 1-2) y `rayMarchDEM` (Telémetro), así que el terreno que se ve acá
+// es exactamente el que ya se está usando en los cálculos.
+const CESIUM_VERSION = '1.120';
+let cesiumCargando = null;
+function cargarCesium() {
+  if (window.Cesium) return Promise.resolve();
+  if (cesiumCargando) return cesiumCargando;
+  cesiumCargando = new Promise((resolve, reject) => {
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = `https://cesium.com/downloads/cesiumjs/releases/${CESIUM_VERSION}/Build/Cesium/Widgets/widgets.css`;
+    document.head.appendChild(link);
+    const script = document.createElement('script');
+    script.src = `https://cesium.com/downloads/cesiumjs/releases/${CESIUM_VERSION}/Build/Cesium/Cesium.js`;
+    script.onload = () => resolve();
+    script.onerror = () => { cesiumCargando = null; reject(new Error('No se pudo cargar Cesium (¿sin conexión?)')); };
+    document.head.appendChild(script);
+  });
+  return cesiumCargando;
+}
+
+// SAMPLES=32 por tile: suficiente para nuestro DEM fuente (~19 m/px de AWS Terrain Tiles,
+// o la resolución del GeoTIFF propio) sin generar miles de muestras por tile innecesarias.
+function crearTerrainProviderDesdeDEMLocal() {
+  const SAMPLES = 32;
+  const tilingScheme = new Cesium.GeographicTilingScheme();
+  return new Cesium.CustomHeightmapTerrainProvider({
+    width: SAMPLES, height: SAMPLES, tilingScheme,
+    callback: (x, y, level) => {
+      const rect = tilingScheme.tileXYToRectangle(x, y, level);
+      const heights = new Float32Array(SAMPLES * SAMPLES);
+      for (let j = 0; j < SAMPLES; j++) {
+        const lat = Cesium.Math.toDegrees(Cesium.Math.lerp(rect.north, rect.south, j / (SAMPLES - 1)));
+        for (let i = 0; i < SAMPLES; i++) {
+          const lon = Cesium.Math.toDegrees(Cesium.Math.lerp(rect.west, rect.east, i / (SAMPLES - 1)));
+          // A niveles de zoom bajos, GeographicTilingScheme entrega tiles cuyo `rect.north`
+          // o `rect.south` cae en lat=±90 exactos (el tile raíz cubre todo el globo). Web
+          // Mercator no puede representar los polos (singularidad matemática de la
+          // proyección) y proj4 lanza ahí una excepción sin capturar — eso detiene TODO el
+          // render loop de Cesium ("Rendering has stopped"), dejando la escena en negro
+          // permanentemente. Fuera de nuestro DEM local da 0 de todos modos, así que ante
+          // cualquier fallo de proyección simplemente se trata como "sin dato".
+          let h;
+          try { h = elevacionLocalSync(lat, lon); } catch (e) { h = null; }
+          heights[j * SAMPLES + i] = h === null ? 0 : h;
+        }
+      }
+      return heights;
+    }
+  });
 }
 
 // Modo dibujo de rectángulo en el mapa; llama onDone({minLat,maxLat,minLon,maxLon})
@@ -1540,6 +1605,100 @@ function useOrientation() {
   return { ...estado, solicitarPermiso };
 }
 
+// ── Clinómetro: rumbo/manteo apoyando el teléfono sobre el plano a medir ──
+// Método de brújula de campo (mismo que apps tipo FieldMove/GeoID): se apoya la parte
+// TRASERA del teléfono sobre la superficie del plano (pantalla hacia afuera, legible), igual
+// que se apoyaría una brújula Brunton. La normal de la pantalla (eje Z del dispositivo,
+// saliendo hacia el usuario) coincide entonces con la normal del plano geológico.
+//
+// Distinto del telémetro: allá se usa hacia dónde APUNTA la cámara (eje horizontal del
+// dispositivo sostenido en vertical); acá se usa hacia dónde MIRA la pantalla (eje Z) con el
+// teléfono plano sobre la roca — geometría distinta, no reutilizable de useOrientation().
+//
+// Matriz de rotación device→mundo de la especificación W3C DeviceOrientationEvent (alpha
+// rotación en Z, beta en X', gamma en Y''); aplicada al eje Z del dispositivo (0,0,1) da la
+// normal en coordenadas (Este, Norte, Arriba). Verificado con casos analíticos: alpha=0
+// (top apunta al norte) + beta=0 + gamma=0 → normal=(0,0,1) (plano horizontal, manteo 0°);
+// alpha=0 + beta=90° + gamma=0 (teléfono vertical, top hacia el norte) → normal=(0,-1,0)
+// (plano vertical mirando al sur, manteo 90°) — consistente con girar el borde superior
+// desde "plano mirando arriba" hacia "vertical" hace que la cara mire hacia el lado opuesto
+// a donde apuntaba ese borde.
+function normalDesdeOrientacionDispositivo(alphaDeg, betaDeg, gammaDeg) {
+  const a = toRad(alphaDeg), b = toRad(betaDeg), g = toRad(gammaDeg);
+  const ca = Math.cos(a), sa = Math.sin(a);
+  const cb = Math.cos(b), sb = Math.sin(b);
+  const cg = Math.cos(g), sg = Math.sin(g);
+  const nE = ca * sg + cg * sa * sb;
+  const nN = sa * sg - ca * cg * sb;
+  const nUp = cb * cg;
+  return { nE, nN, nUp };
+}
+
+function useClinometro() {
+  const [estado, setEstado] = useState({
+    rumbo: null, manteo: null, disponible: null, absoluta: false, error: '',
+  });
+  const ultimoEvento  = useRef(0);
+  const tieneAbsoluto = useRef(false);
+  const [rearme, setRearme] = useState(0);
+
+  // OJO iOS: requestPermission() SOLO funciona dentro de un gesto del usuario (ver
+  // useOrientation, mismo patrón).
+  const solicitarPermiso = async () => {
+    let ok = true;
+    if (typeof DeviceOrientationEvent !== 'undefined' &&
+        typeof DeviceOrientationEvent.requestPermission === 'function') {
+      try {
+        ok = (await DeviceOrientationEvent.requestPermission()) === 'granted';
+        if (!ok) setEstado(s => ({ ...s, disponible: false,
+                                   error: 'Permiso de orientación denegado' }));
+      } catch (e) {
+        ok = false;
+        setEstado(s => ({ ...s, disponible: false,
+                          error: 'No se pudo solicitar permiso de orientación' }));
+      }
+    }
+    setRearme(Date.now());
+    return ok;
+  };
+
+  useEffect(() => {
+    const procesar = (e, esAbsoluto) => {
+      if (![e.alpha, e.beta, e.gamma].every(Number.isFinite)) return;
+      const { nE, nN, nUp } = normalDesdeOrientacionDispositivo(e.alpha, e.beta, e.gamma);
+      // Normal hacia arriba: si el teléfono quedó "boca abajo" contra la roca (el otro lado
+      // apoyado), se invierte para seguir midiendo el mismo plano, no su opuesto.
+      const up = nUp < 0 ? -1 : 1;
+      const { rumbo, manteo } = rumboManteoDesdeNormal(up * nE, up * nN, up * nUp);
+      ultimoEvento.current = Date.now();
+      setEstado(s => ({ ...s, rumbo, manteo, disponible: true,
+                        absoluta: esAbsoluto, error: '' }));
+    };
+    // Mismo motivo que en useOrientation: preferir siempre el evento absoluto para no dejar
+    // que el relativo (a la deriva en Android) pise un rumbo bueno intercaladamente.
+    const onAbs = (e) => { tieneAbsoluto.current = true; procesar(e, true); };
+    const onRel = (e) => {
+      if (tieneAbsoluto.current) return;
+      procesar(e, e.absolute === true);
+    };
+    window.addEventListener('deviceorientationabsolute', onAbs);
+    window.addEventListener('deviceorientation', onRel);
+    const chk = setTimeout(() => {
+      if (ultimoEvento.current <= rearme) {
+        setEstado(s => ({ ...s, disponible: false, error: s.error ||
+          'Sin brújula/inclinómetro: ingresa rumbo y manteo a mano' }));
+      }
+    }, 2500);
+    return () => {
+      window.removeEventListener('deviceorientationabsolute', onAbs);
+      window.removeEventListener('deviceorientation', onRel);
+      clearTimeout(chk);
+    };
+  }, [rearme]);
+
+  return { ...estado, solicitarPermiso };
+}
+
 // GPS en vivo como origen del telémetro.
 function useGeolocacionViva() {
   const [pos, setPos] = useState(null);
@@ -1741,6 +1900,16 @@ function App() {
   const capasTelRef = useRef({});
   const mapRef  = useRef(null);
   const leafRef = useRef(null);
+  const cesiumDivRef    = useRef(null);
+  const cesiumViewerRef = useRef(null);
+  const [vista3d, setVista3d] = useState({ estado: 'idle', error: '' });
+  // El mapa Leaflet se crea en un ref (no en state) para no re-renderizar todo el árbol
+  // en cada operación del mapa, pero eso deja un hueco: los efectos de los hijos (ej. el
+  // listener de click de TabPuntuales, montado por defecto) corren ANTES que este efecto
+  // en el primer render, así que ven `map.current === null` y nunca llegan a registrar
+  // nada. `mapReady` solo sirve para forzar esa segunda pasada de efectos una vez que el
+  // mapa ya existe.
+  const [mapReady, setMapReady] = useState(false);
 
   useEffect(() => {
     if (leafRef.current) return;
@@ -1751,7 +1920,56 @@ function App() {
       maxNativeZoom: 18
     }).addTo(map);
     leafRef.current = map;
+    setMapReady(true);
   }, []);
+
+  // Vista 3D: se crea una sola vez, en cuanto el usuario entra al tab por primera vez con
+  // un DEM local activo (si aún no hay DEM, solo se avisa — no hay terreno mundial gratis
+  // sin cuenta/token, ver comentario de crearTerrainProviderDesdeDEMLocal). No se destruye
+  // al salir del tab: recrear el Viewer y volver a construir el terreno en cada visita
+  // sería lento, y el terreno no cambia salvo que el usuario baje o cargue otro DEM.
+  useEffect(() => {
+    if (tab !== 'vista3d' || cesiumViewerRef.current) return;
+    if (!localDEM) { setVista3d({ estado: 'sin_dem', error: '' }); return; }
+    let cancelado = false;
+    setVista3d({ estado: 'cargando', error: '' });
+    (async () => {
+      try {
+        await cargarCesium();
+        if (cancelado) return;
+        const terrainProvider = crearTerrainProviderDesdeDEMLocal();
+        const imageryLayer = await Cesium.ImageryLayer.fromProviderAsync(
+          Cesium.ArcGisMapServerImageryProvider.fromUrl(
+            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer'));
+        if (cancelado) return;
+        const viewer = new Cesium.Viewer(cesiumDivRef.current, {
+          terrainProvider, baseLayer: imageryLayer,
+          baseLayerPicker: false, geocoder: false, homeButton: true,
+          sceneModePicker: true, navigationHelpButton: false,
+          animation: false, timeline: false, fullscreenButton: true,
+        });
+        cesiumViewerRef.current = viewer;
+        window.__cesiumViewer = viewer; // ayuda para depurar desde la consola del navegador
+        // Centrar donde el usuario ya estaba mirando en 2D, no en un punto fijo.
+        const c = leafRef.current ? leafRef.current.getCenter() : { lat: CHILE_CENTER[0], lng: CHILE_CENTER[1] };
+        viewer.camera.setView({
+          destination: Cesium.Cartesian3.fromDegrees(c.lng, c.lat - 0.03, 5000),
+          orientation: { heading: 0, pitch: Cesium.Math.toRadians(-35), roll: 0 }
+        });
+        if (!cancelado) setVista3d({ estado: 'listo', error: '' });
+      } catch (e) {
+        if (!cancelado) setVista3d({ estado: 'error', error: e.message });
+      }
+    })();
+    return () => { cancelado = true; };
+  }, [tab, demInfo]);
+
+  // Leaflet no recalcula bien su tamaño mientras su contenedor tiene display:none (mismo
+  // problema que un contenedor de ancho 0): forzar invalidateSize al volver a mostrarlo.
+  useEffect(() => {
+    if (tab === 'vista3d') { if (cesiumViewerRef.current) cesiumViewerRef.current.resize(); }
+    else if (leafRef.current) { leafRef.current.invalidateSize(); }
+  }, [tab]);
 
   const onUsarEnTab1 = (data) => {
     setTabInput(data);
@@ -1777,18 +1995,56 @@ function App() {
           <button style={S.tab(tab==='telemetro')} onClick={() => setTab('telemetro')}>
             Telémetro
           </button>
+          <button style={S.tab(tab==='vista3d')} onClick={() => setTab('vista3d')}>
+            Vista 3D
+          </button>
         </div>
         <DEMControls map={leafRef} demInfo={demInfo} setDemInfo={setDemInfo} />
         <div style={{flex:1, overflowY:'auto', padding:12}}>
           {tab === 'puntuales'
-            ? <TabPuntuales map={leafRef} externalInput={tabInput} demInfo={demInfo} setDemInfo={setDemInfo} />
+            ? <TabPuntuales map={leafRef} mapReady={mapReady} externalInput={tabInput} demInfo={demInfo} setDemInfo={setDemInfo} />
             : tab === 'linea'
             ? <TabLinea     map={leafRef} onUsarEnTab1={onUsarEnTab1} />
-            : <TabTelemetro map={leafRef} demInfo={demInfo}
-                puntos={puntosTel} setPuntos={setPuntosTel} layersRef={capasTelRef} />}
+            : tab === 'telemetro'
+            ? <TabTelemetro map={leafRef} demInfo={demInfo}
+                puntos={puntosTel} setPuntos={setPuntosTel} layersRef={capasTelRef} />
+            : <PanelVista3D estado={vista3d.estado} error={vista3d.error} />}
         </div>
       </div>
-      <div style={S.mapDiv} ref={mapRef} />
+      <div style={S.mapDiv}>
+        {/* Los dos divs se superponen con position:absolute y alternan por `visibility`,
+            no por `display`. `display:none` colapsa el contenedor a 0×0 y Cesium crea su
+            canvas con esas dimensiones en ese instante — a diferencia de Leaflet, que se
+            recupera con invalidateSize(), el canvas de Cesium queda roto de forma
+            permanente (el render loop nunca vuelve a avanzar). `visibility:hidden`
+            mantiene el layout real en todo momento. */}
+        <div style={{ position:'absolute', inset:0, visibility: tab === 'vista3d' ? 'hidden' : 'visible' }} ref={mapRef} />
+        <div style={{ position:'absolute', inset:0, visibility: tab === 'vista3d' ? 'visible' : 'hidden' }} ref={cesiumDivRef} />
+      </div>
+    </div>
+  );
+}
+
+function PanelVista3D({ estado, error }) {
+  return (
+    <div style={{ fontSize: 13, color: '#444' }}>
+      <div style={{ fontWeight: 700, marginBottom: 8, color: '#1e3a5f' }}>Vista 3D del terreno</div>
+      {estado === 'sin_dem' && (
+        <div>Activa un DEM local (arriba, "Descargar DEM de un área" o tu propio GeoTIFF)
+          para ver el relieve real en 3D. Leaflet muestra la foto satelital sin relieve.</div>
+      )}
+      {estado === 'cargando' && <div>Cargando Cesium y construyendo el terreno…</div>}
+      {estado === 'error' && <div style={LS.error}>{error}</div>}
+      {estado === 'listo' && (
+        <div>
+          Click+arrastrar rota la vista, rueda del mouse hace zoom, click derecho+arrastrar inclina la cámara.
+          <div style={{ marginTop: 10, fontSize: 11, color: '#888' }}>
+            Terreno generado desde el mismo DEM local activo que usan Datos Puntuales y el
+            Telémetro — no es una fuente distinta. Si descargas o cambias de DEM, esta vista
+            no se actualiza sola: recarga la página para reconstruir el terreno con el nuevo.
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1903,11 +2159,74 @@ const LS = {
               padding:'8px 10px', borderRadius:6, fontSize:12, marginTop:8 },
 };
 
+// Toma de dato en terreno: GPS para la posición + clinómetro del teléfono para rumbo/manteo,
+// en vez de escribirlos a mano. Solo se monta mientras el panel está abierto (el hook de
+// componente hijo, no montado por defecto en TabPuntuales) para no gastar GPS/sensores de
+// fondo cuando el usuario no lo está usando.
+function MedirConTelefono({ zona, onUsar, onCerrar }) {
+  const geo   = useGeolocacionViva();
+  const clin  = useClinometro();
+  const [pedido, setPedido] = useState(false);
+
+  const activar = async () => { setPedido(true); await clin.solicitarPermiso(); };
+
+  const listo = geo.pos && Number.isFinite(clin.rumbo) && Number.isFinite(clin.manteo);
+
+  const usar = () => {
+    if (!listo) return;
+    const { E, N } = latLonToUtm(geo.pos.lat, geo.pos.lon, zona);
+    onUsar({ E, N, rumbo: Math.round(clin.rumbo), manteo: Math.round(clin.manteo) });
+  };
+
+  return (
+    <div style={{ background:'#f0f9ff', border:'1.5px solid #0891b2', borderRadius:6,
+                   padding:'8px 10px', marginBottom:8, fontSize:12 }}>
+      {!pedido ? (
+        <button type="button" onClick={activar}
+          style={{ ...LS.btn, marginTop:0, background:'#0891b2', fontSize:12 }}>
+          📱 Medir con el teléfono
+        </button>
+      ) : (
+        <div>
+          <div style={{ color:'#0e5a6b', marginBottom:6 }}>
+            Apoya la parte <b>trasera</b> del teléfono sobre el plano a medir (pantalla hacia
+            arriba, legible), como una brújula de geólogo. Mantenlo quieto un momento.
+          </div>
+          {geo.error && <div style={LS.error}>GPS: {geo.error}</div>}
+          {clin.error && <div style={LS.error}>{clin.error}</div>}
+          {Number.isFinite(clin.rumbo) && Number.isFinite(clin.manteo) && (
+            <div style={{ fontSize:20, fontWeight:700, color:'#0e5a6b', margin:'6px 0' }}>
+              {clin.rumbo.toFixed(0).padStart(3,'0')}° / {clin.manteo.toFixed(0)}°
+            </div>
+          )}
+          <div style={{ color:'#555', fontSize:11 }}>
+            GPS: {geo.pos
+              ? `±${geo.pos.accuracy != null ? Math.round(geo.pos.accuracy) : '?'} m${geo.obsoleto ? ' (desactualizado)' : ''}`
+              : 'buscando señal…'}
+          </div>
+          <div style={{ display:'flex', gap:6, marginTop:8 }}>
+            <button type="button" onClick={usar} disabled={!listo}
+              style={{ ...LS.btn, marginTop:0, flex:1, fontSize:12,
+                       background: listo ? '#16a34a' : '#9ca3af',
+                       cursor: listo ? 'pointer' : 'not-allowed' }}>
+              Usar este dato
+            </button>
+            <button type="button" onClick={onCerrar}
+              style={{ ...LS.btn, marginTop:0, flex:1, fontSize:12, background:'#6b7280' }}>
+              Cancelar
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Sobre este número de elevaciones nuevas conviene bajar el DEM en vez de consultar en línea:
 // una traza de 2 000 m (el valor por defecto) son ~375 puntos y no dispara el aviso.
 const UMBRAL_AVISO_API = 500;
 
-function TabPuntuales({ map, externalInput, demInfo, setDemInfo }) {
+function TabPuntuales({ map, mapReady, externalInput, demInfo, setDemInfo }) {
   const [zona,    setZona]    = useState('19S');
   const [easting, setEasting] = useState('');
   const [northing,setNorthing]= useState('');
@@ -1920,6 +2239,7 @@ function TabPuntuales({ map, externalInput, demInfo, setDemInfo }) {
   const [error,   setError]   = useState('');
   const [aviso,   setAviso]   = useState(null);   // { plan, nAPI, bloqueada, bounds }
   const [demProg, setDemProg] = useState(null);
+  const [midiendo,setMidiendo]= useState(false);  // panel "Medir con el teléfono" abierto
   const layersRef    = useRef({});
   const calculandoRef = useRef(false);
 
@@ -1944,7 +2264,7 @@ function TabPuntuales({ map, externalInput, demInfo, setDemInfo }) {
     };
     m.on('click', onClick);
     return () => m.off('click', onClick);
-  }, [zona, map]);
+  }, [zona, map, mapReady]);
 
   // El aviso lleva dentro la grilla ya calculada: si el usuario edita el formulario deja de
   // corresponder, y "Consultar igual" trazaría con los valores viejos. Se descarta y se
@@ -2070,6 +2390,17 @@ function TabPuntuales({ map, externalInput, demInfo, setDemInfo }) {
 
   return (
     <div>
+      {midiendo
+        ? <MedirConTelefono zona={zona} onCerrar={() => setMidiendo(false)}
+            onUsar={({ E, N, rumbo: ru, manteo: ma }) => {
+              setEasting(String(E)); setNorthing(String(N));
+              setRumbo(String(ru)); setManteo(String(ma));
+              setMidiendo(false);
+            }} />
+        : <button type="button" onClick={() => setMidiendo(true)}
+            style={{ ...LS.btn, marginTop:0, marginBottom:8, background:'#0891b2', fontSize:12 }}>
+            📱 Medir con el teléfono
+          </button>}
       <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap:8}}>
         <label style={LS.label}>
           Zona UTM
@@ -2236,6 +2567,16 @@ function jacobi3x3(A) {
   };
 }
 
+// Rumbo/manteo desde una normal (nE, nN, nZ) que apunta hacia arriba (nZ >= 0).
+// az_buz = atan2(nE, nN)  →  rumbo = az_buz - 90° (mod 360). Compartida entre el ajuste de
+// plano por PCA (Trazar Línea) y el clinómetro del teléfono (Datos Puntuales).
+function rumboManteoDesdeNormal(nE, nN, nZ) {
+  const az_buz = mod360(toDeg(Math.atan2(nE, nN)));
+  const rumbo  = mod360(az_buz - 90);
+  const manteo = toDeg(Math.acos(Math.min(1, nZ)));   // nZ = cos(manteo) si ||n||=1
+  return { rumbo, manteo };
+}
+
 // Ajuste de plano por PCA (mínimos cuadrados 3D).
 // puntos3D: [{E, N, Z}] en metros (coordenadas absolutas)
 // Devuelve { rumbo, manteo, rmse, normal: [nE, nN, nZ], centroide: {E, N, Z} }
@@ -2263,11 +2604,7 @@ function ajustarPlano(puntos3D) {
   // Asegurar que la normal apunte hacia arriba (nZ > 0)
   if (nZ < 0) { nE = -nE; nN = -nN; nZ = -nZ; }
 
-  // Extraer rumbo y manteo desde la normal (n = (nE, nN, nZ))
-  // az_buz = atan2(nE, nN)  →  rumbo = az_buz - 90° (mod 360)
-  const az_buz = mod360(toDeg(Math.atan2(nE, nN)));
-  const rumbo  = mod360(az_buz - 90);
-  const manteo = toDeg(Math.acos(Math.min(1, nZ)));   // nZ = cos(manteo) si ||n||=1
+  const { rumbo, manteo } = rumboManteoDesdeNormal(nE, nN, nZ);
 
   // RMSE: distancia de cada punto al plano ajustado (en metros)
   const mag = Math.sqrt(nE*nE + nN*nN + nZ*nZ);
@@ -2710,10 +3047,12 @@ async function importarKMZ(file, zona, leafMap, markersRef, polylineRef, setPunt
     markersRef.current = [];
     if (polylineRef.current) { leafMap.removeLayer(polylineRef.current); polylineRef.current = null; }
 
-    // Subsamplear si hay más de 200 puntos
+    // Subsamplear si hay más de 200 puntos. El último punto se conserva siempre: es el
+    // final geológico de la traza y el filtro por módulo casi nunca cae justo ahí.
     const maxPuntos = 200;
     const step = coordPairs.length > maxPuntos ? Math.ceil(coordPairs.length / maxPuntos) : 1;
-    const filtrados = coordPairs.filter((_, i) => i % step === 0);
+    const ultimo = coordPairs.length - 1;
+    const filtrados = coordPairs.filter((_, i) => i % step === 0 || i === ultimo);
 
     const nuevos = filtrados.map((p, i) => {
       const { E, N } = latLonToUtm(p.lat, p.lon, zona);
@@ -2752,7 +3091,10 @@ function TabLinea({ map, onUsarEnTab1 }) {
     const m = map.current;
     if (!m) return;
     if (modo !== 'dibujo') {
-      m.off('click');
+      // El listener 'click' de este componente (si lo había) ya lo quita el cleanup del
+      // efecto anterior al cambiar `modo` — no volver a llamar m.off('click') sin handler
+      // aquí, porque eso borra TODOS los listeners de click del mapa, incluidos los de
+      // otros componentes (ej. TabPuntuales).
       m.getContainer().style.cursor = '';
       return;
     }
