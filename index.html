@@ -2655,6 +2655,22 @@ function TabPuntuales({ map, mapReady, externalInput, demInfo, setDemInfo, setPl
         color, fillColor: color, fillOpacity: 0.15, weight: 2, dashArray: '6 4'
       }).addTo(m);
 
+      // Con distancias asimétricas, el punto queda lejos del centro del rectángulo y esa
+      // diferencia es difícil de notar a ojo sobre el mapa — se marcan los dos extremos con
+      // su distancia real para que quede explícito sin tener que medir el dibujo.
+      if (largoAtras !== undefined) {
+        const ruRad = toRad(ru);
+        const sE = Math.sin(ruRad), sN = Math.cos(ruRad);
+        const finAdelante = utmToLatLon(E0 + largo * sE, N0 + largo * sN, zona);
+        const finAtras    = utmToLatLon(E0 - largoAtras * sE, N0 - largoAtras * sN, zona);
+        const estiloExtremo = { radius: 4, color: '#fff', fillColor: color, fillOpacity: 1, weight: 1.5 };
+        const estiloEtiqueta = { permanent: true, direction: 'top' };
+        capas.finAdelante = L.circleMarker([finAdelante.lat, finAdelante.lon], estiloExtremo)
+          .bindTooltip(`${largo} m`, estiloEtiqueta).addTo(m);
+        capas.finAtras = L.circleMarker([finAtras.lat, finAtras.lon], estiloExtremo)
+          .bindTooltip(`${largoAtras} m`, estiloEtiqueta).addTo(m);
+      }
+
       layersRef.current[id] = capas;
 
       setPlanos(prev => [...prev, {
