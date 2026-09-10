@@ -1362,7 +1362,8 @@ function cargarCesium() {
 // SAMPLES=32 por tile: suficiente para nuestro DEM fuente (~19 m/px de AWS Terrain Tiles,
 // o la resolución del GeoTIFF propio) sin generar miles de muestras por tile innecesarias.
 function crearTerrainProviderDesdeDEMLocal() {
-  const SAMPLES = 32;
+  const SAMPLES = 48; // más densidad de malla que sirva de algo requiere DEM fuente más fino
+                       // (ver localDEM); esto solo reduce el facetado visible al acercarse mucho.
   const tilingScheme = new Cesium.GeographicTilingScheme();
   return new Cesium.CustomHeightmapTerrainProvider({
     width: SAMPLES, height: SAMPLES, tilingScheme,
@@ -1749,22 +1750,32 @@ function zPlano(z0, rumbo, manteo, dE, dN) {
 // paso por defecto 90 m = resolución del DEM de Open-Meteo (muestrear más fino no
 // agrega info real y multiplica las peticiones, gatillando rate-limit 429).
 // maxPuntos acota el total: si la traza es larga, sube el paso en vez de saturar la API.
-function grillaMuestreo(E0, N0, zona, rumbo, longitudM, paso = 90, maxPuntos = 2500) {
+// Por defecto (longitudAtras omitido) el comportamiento es el simétrico de siempre: longitudM
+// es el largo TOTAL de la traza, mitad a cada lado del punto. Si se pasa longitudAtras, el
+// punto deja de ser el centro: longitudM pasa a ser la distancia real hacia el lado del rumbo
+// y longitudAtras la distancia real hacia el lado opuesto — no siempre el punto medido es el
+// centro natural de lo que se quiere ver (ej. el afloramiento sigue mucho más hacia un lado).
+function grillaMuestreo(E0, N0, zona, rumbo, longitudM, longitudAtras, paso = 90, maxPuntos = 2500) {
   const ruRad = toRad(rumbo);
-  const anchoCorredor = Math.min(longitudM * 0.3, 1000);
+  const longitudAdelante = longitudAtras === undefined ? longitudM / 2 : longitudM;
+  longitudAtras = longitudAtras === undefined ? longitudM / 2 : longitudAtras;
+  // *0.3 sobre la suma de ambos lados reproduce exactamente longitudM*0.3 en el caso simétrico
+  // (donde longitudAdelante+longitudAtras = longitudM).
+  const anchoCorredor = Math.min((longitudAdelante + longitudAtras) * 0.3, 1000);
   // Subir el paso hasta que el total de puntos quepa en maxPuntos
   let p = paso;
   while (p < 2000) {
-    const nLong = 2 * Math.ceil(longitudM / 2 / p) + 1;
+    const nLong = Math.ceil(longitudAdelante / p) + Math.ceil(longitudAtras / p) + 1;
     const nPerp = 2 * Math.ceil(anchoCorredor / p) + 1;
     if (nLong * nPerp <= maxPuntos) break;
     p += 30;
   }
-  const mitad = Math.ceil(longitudM / 2 / p);
+  const nAdelante = Math.ceil(longitudAdelante / p);
+  const nAtras    = Math.ceil(longitudAtras / p);
   const mitadPerp = Math.ceil(anchoCorredor / p);
   const points = [];
   // Orden i-mayor / j-menor: necesario para reconstruir la grilla 2D al extraer la traza
-  for (let i = -mitad; i <= mitad; i++) {
+  for (let i = -nAtras; i <= nAdelante; i++) {
     for (let j = -mitadPerp; j <= mitadPerp; j++) {
       const dE = i * p * Math.sin(ruRad) - j * p * Math.cos(ruRad);
       const dN = i * p * Math.cos(ruRad) + j * p * Math.sin(ruRad);
@@ -1772,7 +1783,7 @@ function grillaMuestreo(E0, N0, zona, rumbo, longitudM, paso = 90, maxPuntos = 2
       points.push({ lat, lon, dE, dN });
     }
   }
-  return { points, nLong: 2 * mitad + 1, nPerp: 2 * mitadPerp + 1 };
+  return { points, nLong: nAdelante + nAtras + 1, nPerp: 2 * mitadPerp + 1 };
 }
 
 // Traza de afloramiento = intersección plano–terreno, por cruce de signo de
@@ -1807,23 +1818,43 @@ function extraerTraza(grilla, nLong, nPerp, z0, rumbo, manteo) {
   return pts;
 }
 
-function cornersPlano3D(E0, N0, z0, zona, rumbo, manteo, L) {
+// Ladelante/Latras: por defecto (Latras omitido) el comportamiento de siempre — L es el largo
+// TOTAL, mitad a cada lado del punto. Si se pasa Latras, el punto deja de ser el centro: L pasa
+// a ser la distancia real hacia el lado del rumbo y Latras la distancia real hacia el lado
+// opuesto (no siempre el punto medido es el centro natural de lo que se quiere representar).
+// El ancho en la dirección de buzamiento no cambia con esta asimetría — usa el promedio de
+// ambos lados, igual de proporcionado que antes.
+function cornersPlano3D(E0, N0, z0, zona, rumbo, manteo, L, Latras) {
   const az   = toRad(azBuzamiento(rumbo));
   const dip  = toRad(manteo);
   const sE = Math.sin(toRad(rumbo)), sN = Math.cos(toRad(rumbo));
   const dE = Math.sin(az) * Math.cos(dip);
   const dN = Math.cos(az) * Math.cos(dip);
   const dZ = -Math.sin(dip);
-  const half = L / 2;
+  const haciaAdelante = Latras === undefined ? L / 2 : L;
+  const haciaAtras    = Latras === undefined ? L / 2 : Latras;
+  const halfBuz = (haciaAdelante + haciaAtras) / 2;
   return [
-    [+half * sE + half * dE, +half * sN + half * dN,  half * dZ],
-    [+half * sE - half * dE, +half * sN - half * dN, -half * dZ],
-    [-half * sE - half * dE, -half * sN - half * dN, -half * dZ],
-    [-half * sE + half * dE, -half * sN + half * dN,  half * dZ],
+    [+haciaAdelante * sE + halfBuz * dE, +haciaAdelante * sN + halfBuz * dN,  halfBuz * dZ],
+    [+haciaAdelante * sE - halfBuz * dE, +haciaAdelante * sN - halfBuz * dN, -halfBuz * dZ],
+    [-haciaAtras    * sE - halfBuz * dE, -haciaAtras    * sN - halfBuz * dN, -halfBuz * dZ],
+    [-haciaAtras    * sE + halfBuz * dE, -haciaAtras    * sN + halfBuz * dN,  halfBuz * dZ],
   ].map(([de, dn, dz]) => {
     const { lat, lon } = utmToLatLon(E0 + de, N0 + dn, zona);
     return [lat, lon, z0 + dz];
   });
+}
+
+// Direcciones unitarias de rumbo (horizontal) y buzamiento (con componente vertical) de un
+// plano — misma trigonometría que cornersPlano3D, extraída para reutilizar en los gizmos del
+// manipulador de Vista 3D (que necesitan estas direcciones sin pasar por corners completos).
+function direccionesPlano(rumbo, manteo) {
+  const az  = toRad(azBuzamiento(rumbo));
+  const dip = toRad(manteo);
+  return {
+    rumboDir: [Math.sin(toRad(rumbo)), Math.cos(toRad(rumbo)), 0],
+    buzDir:   [Math.sin(az) * Math.cos(dip), Math.cos(az) * Math.cos(dip), -Math.sin(dip)],
+  };
 }
 
 // ── Control de DEM compartido (descarga por área + guardar) ──
@@ -1903,6 +1934,13 @@ function App() {
   const cesiumDivRef    = useRef(null);
   const cesiumViewerRef = useRef(null);
   const [vista3d, setVista3d] = useState({ estado: 'idle', error: '' });
+  // Plano que Vista 3D muestra y deja ajustar con los gizmos (arrastrar reposiciona/rota/
+  // inclina): viven aquí, no en PanelVista3D, mismo motivo que puntosTel — sobrevive el
+  // cambio de pestaña. Lo llena TabPuntuales ("Ver/ajustar en 3D" en un plano ya calculado);
+  // Vista 3D solo lo edita, no calcula trazas nuevas — la resolución del DEM (~19 m) no basta
+  // para eso, un estrato real es mucho más fino que un píxel del terreno.
+  const [planoEditable, setPlanoEditable] = useState(null); // {E,N,zona,rumbo,manteo,z0,longitud,nombre} | null
+  const capas3DRef = useRef({ poligono: null, gizmoTraslacion: null, gizmoRumbo: null, gizmoManteo: null });
   // El mapa Leaflet se crea en un ref (no en state) para no re-renderizar todo el árbol
   // en cada operación del mapa, pero eso deja un hueco: los efectos de los hijos (ej. el
   // listener de click de TabPuntuales, montado por defecto) corren ANTES que este efecto
@@ -1948,14 +1986,27 @@ function App() {
           sceneModePicker: true, navigationHelpButton: false,
           animation: false, timeline: false, fullscreenButton: true,
         });
+        // Sombreado por sol real: con la misma malla, resalta el relieve mucho más que la
+        // textura satelital sola (que ya trae su propio sombreado "quemado" de cuando se tomó
+        // la foto, sin relación con la posición del sol actual).
+        viewer.scene.globe.enableLighting = true;
         cesiumViewerRef.current = viewer;
         window.__cesiumViewer = viewer; // ayuda para depurar desde la consola del navegador
-        // Centrar donde el usuario ya estaba mirando en 2D, no en un punto fijo.
-        const c = leafRef.current ? leafRef.current.getCenter() : { lat: CHILE_CENTER[0], lng: CHILE_CENTER[1] };
-        viewer.camera.setView({
-          destination: Cesium.Cartesian3.fromDegrees(c.lng, c.lat - 0.03, 5000),
-          orientation: { heading: 0, pitch: Cesium.Math.toRadians(-35), roll: 0 }
-        });
+        // Si se entra con un plano ya elegido ("📐 Ver/ajustar en 3D" desde Datos Puntuales),
+        // centrar ahí — es lo que el usuario vino a ver. Si no, donde ya estaba mirando en 2D.
+        if (planoEditable) {
+          const { lat, lon } = utmToLatLon(planoEditable.E, planoEditable.N, planoEditable.zona);
+          viewer.camera.setView({
+            destination: Cesium.Cartesian3.fromDegrees(lon, lat - 0.02, 1500),
+            orientation: { heading: 0, pitch: Cesium.Math.toRadians(-35), roll: 0 }
+          });
+        } else {
+          const c = leafRef.current ? leafRef.current.getCenter() : { lat: CHILE_CENTER[0], lng: CHILE_CENTER[1] };
+          viewer.camera.setView({
+            destination: Cesium.Cartesian3.fromDegrees(c.lng, c.lat - 0.03, 5000),
+            orientation: { heading: 0, pitch: Cesium.Math.toRadians(-35), roll: 0 }
+          });
+        }
         if (!cancelado) setVista3d({ estado: 'listo', error: '' });
       } catch (e) {
         if (!cancelado) setVista3d({ estado: 'error', error: e.message });
@@ -2002,13 +2053,16 @@ function App() {
         <DEMControls map={leafRef} demInfo={demInfo} setDemInfo={setDemInfo} />
         <div style={{flex:1, overflowY:'auto', padding:12}}>
           {tab === 'puntuales'
-            ? <TabPuntuales map={leafRef} mapReady={mapReady} externalInput={tabInput} demInfo={demInfo} setDemInfo={setDemInfo} />
+            ? <TabPuntuales map={leafRef} mapReady={mapReady} externalInput={tabInput} demInfo={demInfo} setDemInfo={setDemInfo}
+                setPlanoEditable={setPlanoEditable} irAVista3D={() => setTab('vista3d')} />
             : tab === 'linea'
             ? <TabLinea     map={leafRef} onUsarEnTab1={onUsarEnTab1} />
             : tab === 'telemetro'
             ? <TabTelemetro map={leafRef} demInfo={demInfo}
                 puntos={puntosTel} setPuntos={setPuntosTel} layersRef={capasTelRef} />
-            : <PanelVista3D estado={vista3d.estado} error={vista3d.error} />}
+            : <PanelVista3D estado={vista3d.estado} error={vista3d.error} viewerRef={cesiumViewerRef}
+                plano={planoEditable} setPlano={setPlanoEditable} capasRef={capas3DRef}
+                onUsarEnTab1={onUsarEnTab1} />}
         </div>
       </div>
       <div style={S.mapDiv}>
@@ -2025,7 +2079,219 @@ function App() {
   );
 }
 
-function PanelVista3D({ estado, error }) {
+// Manipulador de plano estilo Move: muestra el polígono del plano activo sobre el terreno
+// real y deja ajustarlo arrastrando 3 gizmos (misma idea que el "move plane" de Move, pero
+// sin su motor de deformación — acá el plano es rígido, solo cambia posición/rumbo/manteo).
+// No dibuja trazas nuevas: la resolución del DEM (~19 m de AWS Terrain Tiles) no alcanza para
+// eso, un estrato real es mucho más fino que un píxel del terreno — ver memoria del proyecto.
+//
+// Los 3 gizmos y su geometría (E=Este, N=Norte, Z=vertical, todo en el frame ENU local del
+// centroide del plano):
+// - Traslación (blanco, en el centro): arrastrar hace scene.globe.pick contra el terreno real
+//   y mueve el centroide (E,N,Z) ahí — "deslizar el plano sobre la superficie".
+// - Rumbo (rojo, en el extremo de la línea de rumbo): arrastrar intersecta el rayo del mouse
+//   con el plano HORIZONTAL que pasa por el centroide (el rumbo es un concepto horizontal) y
+//   usa atan2(dE,dN) del punto resultante respecto al centroide como nuevo rumbo.
+// - Manteo (azul, en el extremo de la línea de buzamiento): arrastrar intersecta el rayo con
+//   el plano VERTICAL que contiene la dirección de buzamiento (normal = dirección de rumbo,
+//   perpendicular a buzamiento en el plano horizontal) y deriva el manteo de
+//   atan2(-alturaRelativa, distanciaHorizontalEnDireccionBuzamiento).
+// Validado con casos sintéticos (ver conversación): round-trip rumbo/manteo conocido →
+// posición de gizmo → ángulo recuperado, antes de integrarlo a la UI.
+function direccionesENU(lat, lon) {
+  const centro = Cesium.Cartesian3.fromDegrees(lon, lat);
+  const m = Cesium.Transforms.eastNorthUpToFixedFrame(centro);
+  return {
+    east:  Cesium.Matrix4.getColumn(m, 0, new Cesium.Cartesian3()),
+    north: Cesium.Matrix4.getColumn(m, 1, new Cesium.Cartesian3()),
+    up:    Cesium.Matrix4.getColumn(m, 2, new Cesium.Cartesian3()),
+  };
+}
+
+// dirEN=[dE,dN] horizontal en metros → vector unitario ECEF (para construir normales de plano)
+function dirHorizontalAECEF(dirEN, east, north) {
+  const v = Cesium.Cartesian3.add(
+    Cesium.Cartesian3.multiplyByScalar(east, dirEN[0], new Cesium.Cartesian3()),
+    Cesium.Cartesian3.multiplyByScalar(north, dirEN[1], new Cesium.Cartesian3()),
+    new Cesium.Cartesian3());
+  return Cesium.Cartesian3.normalize(v, v);
+}
+
+function posicionesGizmos(plano) {
+  const { E, N, zona, rumbo, manteo, z0, longitud } = plano;
+  const { rumboDir, buzDir } = direccionesPlano(rumbo, manteo);
+  const half = Math.min(Math.max(longitud, 200), 10000) / 2;
+  const central = utmToLatLon(E, N, zona);
+  const pRumbo  = utmToLatLon(E + half * rumboDir[0], N + half * rumboDir[1], zona);
+  const pManteo = utmToLatLon(E + half * buzDir[0],   N + half * buzDir[1],   zona);
+  return {
+    traslacion: Cesium.Cartesian3.fromDegrees(central.lon, central.lat, z0),
+    rumboPos:   Cesium.Cartesian3.fromDegrees(pRumbo.lon, pRumbo.lat, z0),
+    manteoPos:  Cesium.Cartesian3.fromDegrees(pManteo.lon, pManteo.lat, z0 + half * buzDir[2]),
+  };
+}
+
+function PanelVista3D({ estado, error, viewerRef, plano, setPlano, capasRef, onUsarEnTab1 }) {
+  const arrastreRef = useRef(null); // 'traslacion' | 'rumbo' | 'manteo' | null, sin re-render
+  const [exageracion, setExageracion] = useState(1);
+
+  // Exagerar la vertical resalta relieve sutil (útil para estructuras suaves difíciles de ver
+  // a escala real) sin necesitar más resolución de DEM — es una lupa, no agrega datos.
+  useEffect(() => {
+    const v = viewerRef.current;
+    if (!v || estado !== 'listo') return;
+    v.scene.verticalExaggeration = exageracion;
+  }, [exageracion, estado]);
+
+  // (Re)dibuja el polígono + los 3 gizmos cada vez que el plano cambia (incluye arrastres:
+  // cada frame de movimiento actualiza el state, así que esto corre continuamente mientras
+  // se arrastra — barato, son 4 entidades, no una malla completa).
+  useEffect(() => {
+    const v = viewerRef.current;
+    const limpiarCapas = () => {
+      if (!v) return;
+      ['poligono', 'gizmoTraslacion', 'gizmoRumbo', 'gizmoManteo'].forEach(k => {
+        if (capasRef.current[k]) { v.entities.remove(capasRef.current[k]); capasRef.current[k] = null; }
+      });
+    };
+    if (!v || estado !== 'listo' || !plano) { limpiarCapas(); return; }
+
+    const L = Math.min(Math.max(plano.longitud, 200), 10000);
+    const corners = cornersPlano3D(plano.E, plano.N, plano.z0, plano.zona, plano.rumbo, plano.manteo, L);
+    const { traslacion, rumboPos, manteoPos } = posicionesGizmos(plano);
+
+    limpiarCapas();
+    try {
+      capasRef.current.poligono = v.entities.add({
+        polygon: {
+          hierarchy: corners.map(([lat, lon, alt]) => Cesium.Cartesian3.fromDegrees(lon, lat, alt)),
+          perPositionHeight: true,
+          material: Cesium.Color.fromCssColorString('#2563eb').withAlpha(0.45),
+          outline: true, outlineColor: Cesium.Color.fromCssColorString('#2563eb'),
+        }
+      });
+      const estiloGizmo = (color) => ({
+        pixelSize: 14, color: Cesium.Color.fromCssColorString(color),
+        outlineColor: Cesium.Color.WHITE, outlineWidth: 2,
+        disableDepthTestDistance: Number.POSITIVE_INFINITY,
+      });
+      capasRef.current.gizmoTraslacion = v.entities.add({ position: traslacion, point: estiloGizmo('#f5f5f5') });
+      capasRef.current.gizmoRumbo      = v.entities.add({ position: rumboPos,  point: estiloGizmo('#dc2626') });
+      capasRef.current.gizmoManteo     = v.entities.add({ position: manteoPos, point: estiloGizmo('#2563eb') });
+      v.scene.render();
+    } catch (e) {
+      // Mismo riesgo que en crearTerrainProviderDesdeDEMLocal: una geometría degenerada
+      // (longitud casi nula, manteo en un borde numérico) puede hacer que Cesium falle al
+      // triangular el polígono y sin protección eso detiene el render loop para siempre.
+      limpiarCapas();
+    }
+  }, [plano, estado]);
+
+  // Arrastre de los gizmos: LEFT_DOWN decide (por hit-test) qué gizmo se tomó y apaga los
+  // controles normales de cámara para que el mouse mueva el gizmo, no la vista; MOUSE_MOVE
+  // recalcula según el modo; LEFT_UP libera. Un solo handler para los 3, distinguidos por
+  // arrastreRef (no state: cambia en cada pixel de movimiento, no debe re-renderizar ni
+  // reinstalar el handler).
+  useEffect(() => {
+    const v = viewerRef.current;
+    if (!v || estado !== 'listo') return;
+    const controller = v.scene.screenSpaceCameraController;
+    const handler = new Cesium.ScreenSpaceEventHandler(v.scene.canvas);
+
+    handler.setInputAction((evento) => {
+      const picked = v.scene.pick(evento.position);
+      const id = picked && picked.id;
+      if (id && id === capasRef.current.gizmoTraslacion) arrastreRef.current = 'traslacion';
+      else if (id && id === capasRef.current.gizmoRumbo) arrastreRef.current = 'rumbo';
+      else if (id && id === capasRef.current.gizmoManteo) arrastreRef.current = 'manteo';
+      else return;
+      controller.enableRotate = controller.enableTranslate = controller.enableTilt = false;
+    }, Cesium.ScreenSpaceEventType.LEFT_DOWN);
+
+    handler.setInputAction(() => {
+      arrastreRef.current = null;
+      controller.enableRotate = controller.enableTranslate = controller.enableTilt = true;
+    }, Cesium.ScreenSpaceEventType.LEFT_UP);
+
+    handler.setInputAction((movimiento) => {
+      const modo = arrastreRef.current;
+      if (!modo) return;
+      const ray = v.camera.getPickRay(movimiento.endPosition);
+      if (!ray) return;
+
+      if (modo === 'traslacion') {
+        const cartesian = v.scene.globe.pick(ray, v.scene);
+        if (!Cesium.defined(cartesian)) return;
+        const carto = Cesium.Cartographic.fromCartesian(cartesian);
+        const lat = Cesium.Math.toDegrees(carto.latitude), lon = Cesium.Math.toDegrees(carto.longitude);
+        setPlano(prev => {
+          const { E, N } = latLonToUtm(lat, lon, prev.zona);
+          return { ...prev, E, N, z0: carto.height };
+        });
+        return;
+      }
+
+      setPlano(prev => {
+        const central = utmToLatLon(prev.E, prev.N, prev.zona);
+        const centroCartesian = Cesium.Cartesian3.fromDegrees(central.lon, central.lat, prev.z0);
+        const { east, north, up } = direccionesENU(central.lat, central.lon);
+
+        // Cuando el rayo del mouse queda casi paralelo al plano de intersección (mirando el
+        // plano casi de canto), la intersección es numéricamente inestable — un cambio
+        // mínimo en la dirección del rayo mueve el punto de corte enormemente, y el ángulo
+        // resultante salta de forma errática. Umbral 0.05 ≈ 3° entre rayo y plano: por debajo
+        // de eso se ignora el movimiento en vez de aplicar un salto sin sentido.
+        const anguloEstable = (normal) => Math.abs(Cesium.Cartesian3.dot(ray.direction, normal)) > 0.05;
+
+        if (modo === 'rumbo') {
+          if (!anguloEstable(up)) return prev;
+          const planoHorizontal = Cesium.Plane.fromPointNormal(centroCartesian, up);
+          const inter = Cesium.IntersectionTests.rayPlane(ray, planoHorizontal);
+          if (!Cesium.defined(inter)) return prev;
+          const carto = Cesium.Cartographic.fromCartesian(inter);
+          const { E: Ep, N: Np } = latLonToUtm(Cesium.Math.toDegrees(carto.latitude),
+                                                Cesium.Math.toDegrees(carto.longitude), prev.zona);
+          const dE = Ep - prev.E, dN = Np - prev.N;
+          if (Math.abs(dE) < 1e-6 && Math.abs(dN) < 1e-6) return prev; // arrastre justo sobre el eje: indefinido
+          const nuevoRumbo = mod360(toDeg(Math.atan2(dE, dN)));
+          return { ...prev, rumbo: Math.round(nuevoRumbo) };
+        }
+
+        // modo === 'manteo': plano vertical de intersección — debe CONTENER la dirección de
+        // buzamiento y la vertical, así que su normal es la dirección de RUMBO (perpendicular
+        // a ambas). La dirección horizontal de PROYECCIÓN dentro de ese plano es la de
+        // buzamiento "pura" (az_buz como vector horizontal unitario, manteo=0 implícito) y NO
+        // buzDir de direccionesPlano — buzDir ya lleva el factor cos(manteo) del manteo
+        // ACTUAL, así que usarla aquí (para la normal o la proyección) introduce error: un
+        // punto construido con buzDir tiene una componente en la dirección de buzamiento pura
+        // de magnitud half*cos(manteo), así que si esa dirección fuera la normal del plano el
+        // punto ya no estaría sobre él (confirmado con un test sintético: la distancia del
+        // punto al plano mal definido resultó ser exactamente half*cos(manteo)).
+        const rumboRad = toRad(prev.rumbo);
+        const dirRumboPura = [Math.sin(rumboRad), Math.cos(rumboRad), 0];
+        const dirRumboECEF = dirHorizontalAECEF(dirRumboPura, east, north);
+        const azBuzRad = toRad(azBuzamiento(prev.rumbo));
+        const dirBuzHorizPura = [Math.sin(azBuzRad), Math.cos(azBuzRad), 0];
+        const dirBuzHoriz = dirHorizontalAECEF(dirBuzHorizPura, east, north);
+        if (!anguloEstable(dirRumboECEF)) return prev;
+        const planoVertical = Cesium.Plane.fromPointNormal(centroCartesian, dirRumboECEF);
+        const inter = Cesium.IntersectionTests.rayPlane(ray, planoVertical);
+        if (!Cesium.defined(inter)) return prev;
+        const diff = Cesium.Cartesian3.subtract(inter, centroCartesian, new Cesium.Cartesian3());
+        const distHoriz = Cesium.Cartesian3.dot(diff, dirBuzHoriz);
+        const distVert  = Cesium.Cartesian3.dot(diff, up);
+        if (Math.abs(distHoriz) < 1e-6 && Math.abs(distVert) < 1e-6) return prev;
+        const nuevoManteo = Math.max(0, Math.min(89, toDeg(Math.atan2(-distVert, distHoriz))));
+        return { ...prev, manteo: Math.round(nuevoManteo) };
+      });
+    }, Cesium.ScreenSpaceEventType.MOUSE_MOVE);
+
+    return () => {
+      handler.destroy();
+      controller.enableRotate = controller.enableTranslate = controller.enableTilt = true;
+    };
+  }, [estado]);
+
   return (
     <div style={{ fontSize: 13, color: '#444' }}>
       <div style={{ fontWeight: 700, marginBottom: 8, color: '#1e3a5f' }}>Vista 3D del terreno</div>
@@ -2042,6 +2308,48 @@ function PanelVista3D({ estado, error }) {
             Terreno generado desde el mismo DEM local activo que usan Datos Puntuales y el
             Telémetro — no es una fuente distinta. Si descargas o cambias de DEM, esta vista
             no se actualiza sola: recarga la página para reconstruir el terreno con el nuevo.
+          </div>
+
+          <div style={{ marginTop: 14, paddingTop: 10, borderTop: '1px solid #ddd' }}>
+            <label style={{ ...LS.label, fontSize: 12 }}>
+              Exagerar relieve: {exageracion.toFixed(1)}×
+              <input type="range" min={1} max={5} step={0.5} value={exageracion}
+                onChange={e => setExageracion(parseFloat(e.target.value))} />
+            </label>
+            <div style={{ fontSize: 11, color: '#888' }}>
+              Multiplica la altura del terreno — útil para ver estructuras suaves que a escala
+              real casi no se notan. No agrega detalle nuevo, solo lo exagera.
+            </div>
+          </div>
+
+          <div style={{ marginTop: 14, paddingTop: 10, borderTop: '1px solid #ddd' }}>
+            <div style={LS.sectionTitle}>Ajustar plano sobre el terreno</div>
+            {!plano ? (
+              <div style={{ fontSize: 12, color: '#888' }}>
+                Ningún plano seleccionado. Ve a "Datos Puntuales", calcula o elige un plano de
+                la lista y usa el botón 📐 para traerlo acá.
+              </div>
+            ) : (
+              <div>
+                <div style={{ fontSize: 11, color: '#555', marginBottom: 6 }}>
+                  <span style={{ color: '#dc2626' }}>●</span> rojo rota el rumbo &nbsp;
+                  <span style={{ color: '#2563eb' }}>●</span> azul inclina el manteo &nbsp;
+                  <span style={{ color: '#999' }}>●</span> blanco mueve el plano
+                </div>
+                <div style={{ background: '#f0fdf4', border: '1px solid #16a34a', borderRadius: 6,
+                              padding: '6px 8px', fontSize: 12, color: '#14532d' }}>
+                  Rumbo <b>{plano.rumbo}°</b> / Manteo <b>{plano.manteo}°</b>
+                </div>
+                {onUsarEnTab1 && (
+                  <button type="button"
+                    onClick={() => onUsarEnTab1({ rumbo: plano.rumbo, manteo: plano.manteo,
+                                                   zona: plano.zona, E: Math.round(plano.E), N: Math.round(plano.N) })}
+                    style={{ ...LS.btn, marginTop: 8, fontSize: 12, background: '#16a34a' }}>
+                    → Usar en Datos Puntuales
+                  </button>
+                )}
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -2226,13 +2534,15 @@ function MedirConTelefono({ zona, onUsar, onCerrar }) {
 // una traza de 2 000 m (el valor por defecto) son ~375 puntos y no dispara el aviso.
 const UMBRAL_AVISO_API = 500;
 
-function TabPuntuales({ map, mapReady, externalInput, demInfo, setDemInfo }) {
+function TabPuntuales({ map, mapReady, externalInput, demInfo, setDemInfo, setPlanoEditable, irAVista3D }) {
   const [zona,    setZona]    = useState('19S');
   const [easting, setEasting] = useState('');
   const [northing,setNorthing]= useState('');
   const [rumbo,   setRumbo]   = useState('');
   const [manteo,  setManteo]  = useState('');
   const [longitud,setLongitud]= useState('2000');
+  const [asimetrico, setAsimetrico] = useState(false); // false: longitud es el TOTAL, mitad a cada lado
+  const [longitudAtras, setLongitudAtras] = useState('1000'); // solo se usa si asimetrico=true
   const [nombre,  setNombre]  = useState('');
   const [planos,  setPlanos]  = useState([]);
   const [loading, setLoading] = useState(false);
@@ -2269,7 +2579,7 @@ function TabPuntuales({ map, mapReady, externalInput, demInfo, setDemInfo }) {
   // El aviso lleva dentro la grilla ya calculada: si el usuario edita el formulario deja de
   // corresponder, y "Consultar igual" trazaría con los valores viejos. Se descarta y se
   // vuelve a evaluar en el próximo "Calcular traza".
-  useEffect(() => { setAviso(null); }, [zona, easting, northing, rumbo, manteo, longitud]);
+  useEffect(() => { setAviso(null); }, [zona, easting, northing, rumbo, manteo, longitud, asimetrico, longitudAtras]);
 
   // Valida el formulario y arma la grilla de muestreo, sin tocar la red todavía: así se
   // puede estimar el gasto de API antes de disparar una tanda grande de peticiones.
@@ -2277,14 +2587,21 @@ function TabPuntuales({ map, mapReady, externalInput, demInfo, setDemInfo }) {
     const E0 = parseFloat(easting), N0 = parseFloat(northing);
     const ru = parseFloat(rumbo),   ma = parseFloat(manteo);
     const largo = parseFloat(longitud);
-    if ([E0,N0,ru,ma,largo].some(isNaN)) { setError('Completa todos los campos numéricos.'); return null; }
+    // Sin asimetría, largoAtras queda undefined: grillaMuestreo/cornersPlano3D usan su
+    // comportamiento de siempre (largo = TOTAL, mitad a cada lado del punto medido).
+    const largoAtras = asimetrico ? parseFloat(longitudAtras) : undefined;
+    if ([E0,N0,ru,ma,largo].some(isNaN) || (asimetrico && isNaN(largoAtras))) {
+      setError('Completa todos los campos numéricos.'); return null;
+    }
     if (ru < 0 || ru > 360) { setError('Rumbo debe estar entre 0° y 360°.'); return null; }
     if (ma < 0 || ma >= 90) { setError('Manteo debe estar entre 0° y 89°.'); return null; }
-    if (largo > 10000)      { setError('Longitud máxima 10 000 m (usa DEM local para áreas grandes).'); return null; }
+    if (largo > 10000 || (asimetrico && largoAtras > 10000)) {
+      setError('Longitud máxima 10 000 m por lado (usa DEM local para áreas grandes).'); return null;
+    }
     if (!nombre.trim())     { setError('Ingresa un nombre.'); return null; }
     const { lat: lat0, lon: lon0 } = utmToLatLon(E0, N0, zona);
-    return { E0, N0, ru, ma, largo, lat0, lon0,
-             grilla: grillaMuestreo(E0, N0, zona, ru, largo) };
+    return { E0, N0, ru, ma, largo, largoAtras, lat0, lon0,
+             grilla: grillaMuestreo(E0, N0, zona, ru, largo, largoAtras) };
   };
 
   const calcular = async () => {
@@ -2305,7 +2622,7 @@ function TabPuntuales({ map, mapReady, externalInput, demInfo, setDemInfo }) {
 
   // avisoPrevio: mensaje que debe sobrevivir al cálculo (ej. tiles de DEM que fallaron);
   // si no se pasa, el cálculo parte con el panel de errores limpio.
-  const ejecutar = async ({ E0, N0, ru, ma, largo, lat0, lon0, grilla }, avisoPrevio = '') => {
+  const ejecutar = async ({ E0, N0, ru, ma, largo, largoAtras, lat0, lon0, grilla }, avisoPrevio = '') => {
     if (calculandoRef.current) return;
     setError(avisoPrevio); setAviso(null);
     calculandoRef.current = true;
@@ -2316,7 +2633,7 @@ function TabPuntuales({ map, mapReady, externalInput, demInfo, setDemInfo }) {
 
       const conElev = await getElevacionesMixta(grilla.points);
       const traza = extraerTraza(conElev, grilla.nLong, grilla.nPerp, z0, ru, ma);
-      const corners = cornersPlano3D(E0, N0, z0, zona, ru, ma, largo);
+      const corners = cornersPlano3D(E0, N0, z0, zona, ru, ma, largo, largoAtras);
 
       const color = COLORES[planos.length % COLORES.length];
       const id    = Date.now();
@@ -2342,7 +2659,7 @@ function TabPuntuales({ map, mapReady, externalInput, demInfo, setDemInfo }) {
 
       setPlanos(prev => [...prev, {
         id, nombre, E: E0, N: N0, zona, rumbo: ru, manteo: ma,
-        longitud: largo, color, z0, traza, corners, visible: true
+        longitud: largo, longitudAtras, color, z0, traza, corners, visible: true
       }]);
 
     } catch (e) {
@@ -2425,10 +2742,22 @@ function TabPuntuales({ map, mapReady, externalInput, demInfo, setDemInfo }) {
           <input type="number" min={0} max={90} value={manteo} onChange={e=>setManteo(e.target.value)} placeholder="30" style={LS.input}/>
         </label>
         <label style={LS.label}>
-          Longitud traza (m)
-          <input type="number" value={longitud} onChange={e=>setLongitud(e.target.value)} placeholder="2000" style={LS.input}/>
+          {asimetrico ? 'Long. hacia el rumbo (m)' : 'Longitud traza (m)'}
+          <input type="number" value={longitud} onChange={e=>setLongitud(e.target.value)}
+                 placeholder={asimetrico ? '1000' : '2000'} style={LS.input}/>
         </label>
       </div>
+      <label style={{ display:'flex', alignItems:'center', gap:6, marginTop:8, fontSize:12, color:'#555' }}>
+        <input type="checkbox" checked={asimetrico} onChange={e=>setAsimetrico(e.target.checked)} />
+        Distancias distintas a cada lado del punto
+      </label>
+      {asimetrico && (
+        <label style={{...LS.label, marginTop:6}}>
+          Long. hacia el rumbo opuesto (m)
+          <input type="number" value={longitudAtras} onChange={e=>setLongitudAtras(e.target.value)}
+                 placeholder="1000" style={LS.input}/>
+        </label>
+      )}
       <label style={{...LS.label, marginTop:4}}>
         Nombre
         <input type="text" value={nombre} onChange={e=>setNombre(e.target.value)} placeholder="Estratificación S1" style={LS.input}/>
@@ -2479,6 +2808,14 @@ function TabPuntuales({ map, mapReady, externalInput, demInfo, setDemInfo }) {
             <div key={p.id} style={{...LS.planRow, borderLeft:`4px solid ${p.color}`}}>
               <span style={{flex:1, fontWeight:600}}>{p.nombre}</span>
               <span style={{fontSize:11, color:'#666'}}>{p.rumbo}°/{p.manteo}°</span>
+              {setPlanoEditable && (
+                <button type="button" title="Ver y ajustar en Vista 3D" style={LS.iconBtn}
+                  onClick={() => {
+                    setPlanoEditable({ E: p.E, N: p.N, zona: p.zona, rumbo: p.rumbo,
+                                       manteo: p.manteo, z0: p.z0, longitud: p.longitud, nombre: p.nombre });
+                    irAVista3D();
+                  }}>📐</button>
+              )}
               <button type="button" onClick={() => toggleVisible(p.id)} style={LS.iconBtn} title="Mostrar/ocultar">
                 {p.visible ? '👁' : '🚫'}
               </button>
