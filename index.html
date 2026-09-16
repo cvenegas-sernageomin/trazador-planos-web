@@ -1184,10 +1184,10 @@ function envolverFetchTerrarium() {
 }
 
 let _demSource = null;
-// worker:false a propósito: esta misma instancia sirve tanto para el cálculo numérico de la
-// traza (unos pocos tiles por cálculo) como, más adelante, para el terreno de "Vista 3D" — así
-// se comparte una sola instancia sin depender de que maplibre-gl.js ya esté cargado
-// (setupMaplibre() solo hace falta para registrar el protocolo `raster-dem` del mapa 3D).
+// "Vista 3D" sigue en Cesium (no se reemplaza por MapLibre): esta instancia de DemSource se usa
+// solo para el cálculo numérico de la traza y para armar el mosaico de "Descargar DEM del área"
+// (ver descargarDEMArea) — no hace falta setupMaplibre(maplibregl), que solo aplica si algún día
+// se agrega un mapa MapLibre real. worker:false: unos pocos tiles por llamada, no un stream.
 function ensureDemSource() {
   if (_demSource) return _demSource;
   envolverFetchTerrarium();
