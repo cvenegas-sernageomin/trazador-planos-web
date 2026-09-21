@@ -1333,6 +1333,7 @@ async function elevacionLocal(lat, lon) {
 // Cada tile pasa además por `envolverFetchTerrarium` (dentro de ensureDemSource), así que
 // queda cacheado en IndexedDB: no solo arma el mosaico en memoria para hoy, sino que dexa la
 // zona lista para calcular offline —incluso en otra sesión— la próxima vez.
+const SIN_DATO_DEM  = -32768;  // convención Terrarium para "sin dato"
 const DEM_MAX_TILES = 256;  // tiles de 256px son ~4× más chicos que los 512px de antes:
                              // mismo tope de área real (~78×78 km) pidiendo 4× más tiles.
 const MERC_EXTENT   = 20037508.342789244;
@@ -1358,7 +1359,10 @@ async function descargarDEMArea(bounds, onProgress) {
     throw new Error(`Área muy grande (${total} tiles). Reduce el rectángulo (máx ${DEM_MAX_TILES}).`);
 
   const TS = 256, W = nx * TS, H = ny * TS;
-  const mosaico = new Float32Array(W * H);
+  // Se inicializa en "sin dato" (< -9000, que elevacionLocalSync trata como null), NO en 0: un
+  // tile que falle quedaba a 0 m y el cálculo lo usaba como si fuera terreno real —un DEM "a nivel
+  // del mar" en plena cordillera—. Con sin-dato el punto cae al servicio en línea, que falla fuerte.
+  const mosaico = new Float32Array(W * H).fill(SIN_DATO_DEM);
   // bbox del mosaico en metros Web Mercator, derivado de los índices de tile
   const tileM = 2 * MERC_EXTENT / Math.pow(2, z);
   const bbox = {
@@ -1398,7 +1402,8 @@ function activarDEM(dem, nombre) {
 
 function avisoTilesFallidos(dem) {
   return `Atención: ${dem.tilesFallidos} de ${dem.tilesTotal} tiles no se pudieron descargar. ` +
-         'Esas zonas quedaron en 0 m y las trazas que las crucen serán incorrectas.';
+         'Esas zonas quedaron sin dato local: una traza que las cruce las consultará en línea ' +
+         '(necesita conexión) y avisará si tampoco puede.';
 }
 
 // Guarda el DEM (mosaico) como GeoTIFF EPSG:3857 descargable
@@ -1479,31 +1484,72 @@ function crearTerrainProviderDesdeDEMLocal() {
   });
 }
 
-// Modo dibujo de rectángulo en el mapa; llama onDone({minLat,maxLat,minLon,maxLon})
+// Modo dibujo de rectángulo en el mapa; llama onDone({minLat,maxLat,minLon,maxLon}).
+// Usa Pointer Events, no los eventos de mouse de Leaflet: en pantalla táctil el navegador no
+// emite mousemove durante un arrastre, así que el rectángulo no se dibujaba y un simple toque
+// (que sí genera mousedown/mouseup de compatibilidad) producía un rectángulo de área cero:
+// descargaba UN tile y anunciaba "DEM activo". setPointerCapture sigue el gesto aunque el
+// dedo o el mouse salgan del mapa, y touch-action:none evita que el navegador lo tome por scroll.
+const RECT_MIN_PX = 12;  // menos que esto es un toque o un temblor, no un rectángulo
 function dibujarRectangulo(map, onDone) {
+  const cont = map.getContainer();
+  const cursorPrev = cont.style.cursor, touchPrev = cont.style.touchAction;
   map.dragging.disable();
-  map.getContainer().style.cursor = 'crosshair';
-  let start = null, rect = null;
-  const fin = () => {
-    map.off('mousedown', down); map.off('mousemove', move); map.off('mouseup', up);
-    map.dragging.enable(); map.getContainer().style.cursor = '';
-    if (rect) map.removeLayer(rect);
+  if (map.touchZoom) map.touchZoom.disable();
+  cont.style.cursor = 'crosshair';
+  cont.style.touchAction = 'none';
+  let start = null, startPx = null, rect = null, pid = null;
+
+  const alPunto = (e) => {
+    const r = cont.getBoundingClientRect();
+    return L.point(e.clientX - r.left, e.clientY - r.top);
   };
-  const down = (e) => { start = e.latlng; };
+  const quitarRect = () => { if (rect) { map.removeLayer(rect); rect = null; } };
+  const fin = () => {
+    cont.removeEventListener('pointerdown', down);
+    cont.removeEventListener('pointermove', move);
+    cont.removeEventListener('pointerup', up);
+    cont.removeEventListener('pointercancel', abortar);
+    map.dragging.enable();
+    if (map.touchZoom) map.touchZoom.enable();
+    cont.style.cursor = cursorPrev; cont.style.touchAction = touchPrev;
+    quitarRect();
+  };
+  // El gesto termina en un `click` que Leaflet entregaría a los demás listeners del mapa (p. ej.
+  // "clic en el mapa llena Easting/Northing" de Datos Puntuales): se traga ese único click.
+  const tragarClick = () => {
+    const t = (ev) => { ev.stopImmediatePropagation(); cont.removeEventListener('click', t, true); };
+    cont.addEventListener('click', t, true);
+    setTimeout(() => cont.removeEventListener('click', t, true), 400);
+  };
+  const down = (e) => {
+    if (start || (e.pointerType === 'mouse' && e.button !== 0)) return;  // 2.º dedo / botón derecho
+    pid = e.pointerId; startPx = alPunto(e); start = map.containerPointToLatLng(startPx);
+    try { cont.setPointerCapture(pid); } catch (_) { /* sin captura: sigue funcionando dentro del mapa */ }
+    e.preventDefault();
+  };
   const move = (e) => {
-    if (!start) return;
-    const bnds = L.latLngBounds(start, e.latlng);
+    if (!start || e.pointerId !== pid) return;
+    const bnds = L.latLngBounds(start, map.containerPointToLatLng(alPunto(e)));
     if (rect) rect.setBounds(bnds);
     else rect = L.rectangle(bnds, { color: '#16a34a', weight: 2, dashArray: '5 5' }).addTo(map);
   };
   const up = (e) => {
-    const s = start; fin();
-    if (s) {
-      const bnds = L.latLngBounds(s, e.latlng);
-      onDone({ minLat: bnds.getSouth(), maxLat: bnds.getNorth(), minLon: bnds.getWest(), maxLon: bnds.getEast() });
-    }
+    if (!start || e.pointerId !== pid) return;
+    const px = alPunto(e), s = start;
+    const chico = Math.abs(px.x - startPx.x) < RECT_MIN_PX || Math.abs(px.y - startPx.y) < RECT_MIN_PX;
+    start = null; pid = null; quitarRect(); tragarClick();
+    if (chico) return;   // sigue en modo dibujo, esperando un arrastre de verdad
+    const bnds = L.latLngBounds(s, map.containerPointToLatLng(px));
+    fin();
+    onDone({ minLat: bnds.getSouth(), maxLat: bnds.getNorth(), minLon: bnds.getWest(), maxLon: bnds.getEast() });
   };
-  map.on('mousedown', down); map.on('mousemove', move); map.on('mouseup', up);
+  const abortar = (e) => { if (e.pointerId === pid) { start = null; pid = null; quitarRect(); } };
+
+  cont.addEventListener('pointerdown', down);
+  cont.addEventListener('pointermove', move);
+  cont.addEventListener('pointerup', up);
+  cont.addEventListener('pointercancel', abortar);
   return fin; // permite cancelar
 }
 
@@ -1946,7 +1992,7 @@ function direccionesPlano(rumbo, manteo) {
 }
 
 // ── Control de DEM compartido (descarga por área + guardar) ──
-function DEMControls({ map, demInfo, setDemInfo }) {
+function DEMControls({ map, demInfo, setDemInfo, tab, irAlMapa2D }) {
   const [modo,  setModo]  = useState('idle'); // 'idle' | 'dibujo' | 'descargando'
   const [prog,  setProg]  = useState(null);
   const [error, setError] = useState('');
@@ -1954,6 +2000,9 @@ function DEMControls({ map, demInfo, setDemInfo }) {
 
   const iniciarDibujo = () => {
     setError(''); setModo('dibujo');
+    // En Vista 3D el mapa Leaflet está oculto bajo el canvas de Cesium: dibujar ahí pedía un
+    // rectángulo sobre un mapa que no recibe el mouse, sin más salida que Cancelar.
+    if (tab === 'vista3d' && irAlMapa2D) irAlMapa2D();
     cancelRef.current = dibujarRectangulo(map.current, async (bounds) => {
       setModo('descargando'); setProg({ hechos: 0, total: 0 });
       try {
@@ -1985,7 +2034,7 @@ function DEMControls({ map, demInfo, setDemInfo }) {
       )}
       {modo === 'dibujo' && (
         <div style={{ fontSize: 12, color: '#0891b2' }}>
-          Arrastra un rectángulo sobre el mapa…
+          Arrastra un rectángulo sobre el mapa (con el dedo o el mouse)…
           <button type="button" onClick={cancelar}
             style={{ ...LS.btn, marginTop: 6, background: '#6b7280', fontSize: 11 }}>Cancelar</button>
         </div>
@@ -2024,6 +2073,15 @@ function App() {
   // pestaña: son datos medidos en terreno, perderlos al tocar otra pestaña sería grave.
   const [puntosTel, setPuntosTel] = useState([]);
   const capasTelRef = useRef({});
+  // Lo mismo para los planos de Datos Puntuales y los puntos de Trazar Línea: viven aquí porque
+  // sus marcadores/polígonos YA están dibujados en el mapa (que no se desmonta). Si el estado
+  // fuera del tab, al cambiar de pestaña se perdía la lista y el botón "Exportar KMZ" mientras
+  // las capas seguían pegadas en el mapa, sin forma de ocultarlas ni borrarlas.
+  const [planos, setPlanos] = useState([]);
+  const capasPlanosRef = useRef({});
+  const [puntosLinea, setPuntosLinea] = useState([]);
+  const marcadoresLineaRef = useRef([]);
+  const polilineaLineaRef  = useRef(null);
   const mapRef  = useRef(null);
   const leafRef = useRef(null);
   const cesiumDivRef    = useRef(null);
@@ -2145,13 +2203,17 @@ function App() {
             Vista 3D
           </button>
         </div>
-        <DEMControls map={leafRef} demInfo={demInfo} setDemInfo={setDemInfo} />
+        <DEMControls map={leafRef} demInfo={demInfo} setDemInfo={setDemInfo}
+          tab={tab} irAlMapa2D={() => setTab('puntuales')} />
         <div style={{flex:1, overflowY:'auto', padding:12}}>
           {tab === 'puntuales'
             ? <TabPuntuales map={leafRef} mapReady={mapReady} externalInput={tabInput} demInfo={demInfo} setDemInfo={setDemInfo}
-                setPlanoEditable={setPlanoEditable} irAVista3D={() => setTab('vista3d')} />
+                setPlanoEditable={setPlanoEditable} irAVista3D={() => setTab('vista3d')}
+                planos={planos} setPlanos={setPlanos} layersRef={capasPlanosRef} />
             : tab === 'linea'
-            ? <TabLinea     map={leafRef} onUsarEnTab1={onUsarEnTab1} />
+            ? <TabLinea     map={leafRef} onUsarEnTab1={onUsarEnTab1}
+                puntos={puntosLinea} setPuntos={setPuntosLinea}
+                markersRef={marcadoresLineaRef} polylineRef={polilineaLineaRef} />
             : tab === 'telemetro'
             ? <TabTelemetro map={leafRef} demInfo={demInfo}
                 puntos={puntosTel} setPuntos={setPuntosTel} layersRef={capasTelRef} />
@@ -2212,17 +2274,34 @@ function dirHorizontalAECEF(dirEN, east, north) {
   return Cesium.Cartesian3.normalize(v, v);
 }
 
+// Extensión del plano hacia cada lado del punto, con los topes de Vista 3D. Es la ÚNICA fuente
+// para el polígono y los gizmos: si divergen, el gizmo de rumbo queda flotando fuera del borde.
+// Sin longitudAtras el plano es simétrico (longitud = TOTAL, mitad a cada lado); con ella,
+// `longitud` es la distancia hacia el rumbo y `longitudAtras` hacia el lado opuesto — igual que
+// en el mapa 2D y en el KMZ.
+function extensionPlano(plano) {
+  const tope = v => Math.min(Math.max(v, 0), 10000);
+  if (plano.longitudAtras === undefined) {
+    const L = Math.min(Math.max(plano.longitud, 200), 10000);
+    return { L, Latras: undefined, adelante: L / 2, atras: L / 2 };
+  }
+  let L = tope(plano.longitud), Latras = tope(plano.longitudAtras);
+  if (L + Latras < 200) { L = Math.max(L, 100); Latras = Math.max(Latras, 100); }  // polígono no degenerado
+  return { L, Latras, adelante: L, atras: Latras };
+}
+
 function posicionesGizmos(plano) {
-  const { E, N, zona, rumbo, manteo, z0, longitud } = plano;
+  const { E, N, zona, rumbo, manteo, z0 } = plano;
   const { rumboDir, buzDir } = direccionesPlano(rumbo, manteo);
-  const half = Math.min(Math.max(longitud, 200), 10000) / 2;
+  const { adelante, atras } = extensionPlano(plano);
+  const halfBuz = (adelante + atras) / 2;   // el ancho en buzamiento usa el promedio (ver cornersPlano3D)
   const central = utmToLatLon(E, N, zona);
-  const pRumbo  = utmToLatLon(E + half * rumboDir[0], N + half * rumboDir[1], zona);
-  const pManteo = utmToLatLon(E + half * buzDir[0],   N + half * buzDir[1],   zona);
+  const pRumbo  = utmToLatLon(E + adelante * rumboDir[0], N + adelante * rumboDir[1], zona);
+  const pManteo = utmToLatLon(E + halfBuz * buzDir[0],    N + halfBuz * buzDir[1],    zona);
   return {
     traslacion: Cesium.Cartesian3.fromDegrees(central.lon, central.lat, z0),
     rumboPos:   Cesium.Cartesian3.fromDegrees(pRumbo.lon, pRumbo.lat, z0),
-    manteoPos:  Cesium.Cartesian3.fromDegrees(pManteo.lon, pManteo.lat, z0 + half * buzDir[2]),
+    manteoPos:  Cesium.Cartesian3.fromDegrees(pManteo.lon, pManteo.lat, z0 + halfBuz * buzDir[2]),
   };
 }
 
@@ -2251,8 +2330,9 @@ function PanelVista3D({ estado, error, viewerRef, plano, setPlano, capasRef, onU
     };
     if (!v || estado !== 'listo' || !plano) { limpiarCapas(); return; }
 
-    const L = Math.min(Math.max(plano.longitud, 200), 10000);
-    const corners = cornersPlano3D(plano.E, plano.N, plano.z0, plano.zona, plano.rumbo, plano.manteo, L);
+    const ext = extensionPlano(plano);
+    const corners = cornersPlano3D(plano.E, plano.N, plano.z0, plano.zona, plano.rumbo, plano.manteo,
+                                   ext.L, ext.Latras);
     const { traslacion, rumboPos, manteoPos } = posicionesGizmos(plano);
 
     limpiarCapas();
@@ -2623,7 +2703,10 @@ function MedirConTelefono({ zona, onUsar, onCerrar }) {
   );
 }
 
-function TabPuntuales({ map, mapReady, externalInput, demInfo, setDemInfo, setPlanoEditable, irAVista3D }) {
+// planos/setPlanos/layersRef viven en App (ver el comentario allí): el tab se desmonta al
+// cambiar de pestaña y con él se perdía la lista de planos y el botón de exportar.
+function TabPuntuales({ map, mapReady, externalInput, demInfo, setDemInfo, setPlanoEditable, irAVista3D,
+                        planos, setPlanos, layersRef }) {
   const [zona,    setZona]    = useState('19S');
   const [easting, setEasting] = useState('');
   const [northing,setNorthing]= useState('');
@@ -2633,11 +2716,9 @@ function TabPuntuales({ map, mapReady, externalInput, demInfo, setDemInfo, setPl
   const [asimetrico, setAsimetrico] = useState(false); // false: longitud es el TOTAL, mitad a cada lado
   const [longitudAtras, setLongitudAtras] = useState('1000'); // solo se usa si asimetrico=true
   const [nombre,  setNombre]  = useState('');
-  const [planos,  setPlanos]  = useState([]);
   const [loading, setLoading] = useState(false);
   const [error,   setError]   = useState('');
   const [midiendo,setMidiendo]= useState(false);  // panel "Medir con el teléfono" abierto
-  const layersRef    = useRef({});
   const calculandoRef = useRef(false);
 
   // Recibir datos desde Tab 2 "→ Usar en Tab 1"
@@ -2678,6 +2759,13 @@ function TabPuntuales({ map, mapReady, externalInput, demInfo, setDemInfo, setPl
     if (ma < 0 || ma >= 90) { setError('Manteo debe estar entre 0° y 89°.'); return null; }
     if (largo > 10000 || (asimetrico && largoAtras > 10000)) {
       setError('Longitud máxima 10 000 m por lado (usa DEM local para áreas grandes).'); return null;
+    }
+    // Sin mínimo, longitud 0 o negativa daba una traza vacía y un rectángulo degenerado sin aviso.
+    // Con asimetría, un lado puede ser 0 (el plano parte en el punto), pero no negativo ni ambos 0.
+    if (asimetrico ? (largo < 0 || largoAtras < 0 || largo + largoAtras <= 0) : largo <= 0) {
+      setError(asimetrico ? 'Las longitudes no pueden ser negativas y al menos una debe ser mayor que 0.'
+                          : 'La longitud debe ser mayor que 0.');
+      return null;
     }
     if (!nombre.trim())     { setError('Ingresa un nombre.'); return null; }
     const { lat: lat0, lon: lon0 } = utmToLatLon(E0, N0, zona);
@@ -2774,6 +2862,8 @@ function TabPuntuales({ map, mapReady, externalInput, demInfo, setDemInfo, setPl
     if (capas) Object.values(capas).forEach(c => map.current.removeLayer(c));
     delete layersRef.current[id];
     setPlanos(prev => prev.filter(p => p.id !== id));
+    // Vista 3D seguía mostrando y dejando editar un plano que ya no existe en la lista.
+    if (setPlanoEditable) setPlanoEditable(prev => (prev && prev.id === id ? null : prev));
   };
 
   return (
@@ -2850,8 +2940,11 @@ function TabPuntuales({ map, mapReady, externalInput, demInfo, setDemInfo, setPl
               {setPlanoEditable && (
                 <button type="button" title="Ver y ajustar en Vista 3D" style={LS.iconBtn}
                   onClick={() => {
-                    setPlanoEditable({ E: p.E, N: p.N, zona: p.zona, rumbo: p.rumbo,
-                                       manteo: p.manteo, z0: p.z0, longitud: p.longitud, nombre: p.nombre });
+                    // longitudAtras: sin ella Vista 3D dibujaba siempre un plano simétrico, aun
+                    // cuando el 2D y el KMZ lo tenían asimétrico (p. ej. 2000 m adelante / 200 atrás).
+                    setPlanoEditable({ id: p.id, E: p.E, N: p.N, zona: p.zona, rumbo: p.rumbo,
+                                       manteo: p.manteo, z0: p.z0, longitud: p.longitud,
+                                       longitudAtras: p.longitudAtras, nombre: p.nombre });
                     irAVista3D();
                   }}>📐</button>
               )}
@@ -3074,6 +3167,12 @@ function analizarPliegue(puntos3D) {
     normales.push(ajustarPlano(seg).normal);
   }
 
+  // Con menos de 3 polos no hay ajuste que valga: con 0 la covarianza queda en NaN y Jacobi
+  // devuelve la identidad — la UI informaba un eje "180°/90°" con RMSE NaN, inventado; con 2, un
+  // gran círculo pasa EXACTO por dos puntos, así que salía "ajuste cilíndrico, RMSE 0°" — la
+  // máxima confianza, por álgebra y no por la calidad del dato. Sin diagnóstico, se dice que faltan.
+  if (normales.length < 3) return null;
+
   // Ajuste de gran círculo (pliegue cilíndrico):
   // Eje del pliegue = eigenvector del valor propio MÍNIMO de la covarianza de las normales
   const nN = normales.length;
@@ -3089,6 +3188,7 @@ function analizarPliegue(puntos3D) {
   let [axE, axN, axZ] = vectors[2]; // eje del pliegue = menor eigenvector
   const axLen = Math.sqrt(axE*axE + axN*axN + axZ*axZ);
   axE/=axLen; axN/=axLen; axZ/=axLen;
+  if (![axE, axN, axZ].every(Number.isFinite)) return null;
 
   // Un eje es un dato axial: el eigenvector sirve igual con signo invertido. La convención
   // geológica reporta el extremo que BUZA (hacia abajo), así que se orienta con axZ ≤ 0 y de
@@ -3208,7 +3308,10 @@ function ResultadoOrientacion({ resultado, zona, puntos, onUsarEnTab1 }) {
       <div style={{marginTop:12, padding:10, background:'#fff7ed', borderRadius:6, border:'1.5px solid #d97706'}}>
         <div style={{fontWeight:700, color:'#d97706', marginBottom:8}}>⚠ Datos insuficientes para clasificar pliegue</div>
         {badge('RMSE plano', ajuste.rmse, 'm')}
-        <div style={{fontSize:12, color:'#666'}}>Agrega más puntos para el análisis de pliegue.</div>
+        <div style={{fontSize:12, color:'#666'}}>
+          El terreno no calza en un solo plano, pero para ajustar el eje de un pliegue hacen falta al
+          menos 7 puntos a lo largo de la traza (con menos no salen los 3 polos mínimos). Agrega más.
+        </div>
       </div>
     );
   }
@@ -3404,10 +3507,20 @@ async function importarKMZ(file, zona, leafMap, markersRef, polylineRef, setPunt
   setError('');
   try {
     const ab  = await file.arrayBuffer();
-    const zip = await JSZip.loadAsync(ab);
-    const kmlEntry = Object.values(zip.files).find(f => f.name.endsWith('.kml'));
-    if (!kmlEntry) { setError('No se encontró archivo .kml dentro del KMZ.'); return; }
-    const kmlText = await kmlEntry.async('text');
+    // El selector ofrece .kmz y .kml, pero antes se descomprimía siempre: un .kml plano fallaba con
+    // "Can't find end of central directory". Un KMZ es un ZIP (firma "PK"); si no lo es, se lee
+    // como texto — por los bytes y no por la extensión, que puede venir mal puesta.
+    const b = new Uint8Array(ab, 0, Math.min(2, ab.byteLength));
+    const esZip = b.length === 2 && b[0] === 0x50 && b[1] === 0x4B;
+    let kmlText;
+    if (esZip) {
+      const zip = await JSZip.loadAsync(ab);
+      const kmlEntry = Object.values(zip.files).find(f => f.name.endsWith('.kml'));
+      if (!kmlEntry) { setError('No se encontró archivo .kml dentro del KMZ.'); return; }
+      kmlText = await kmlEntry.async('text');
+    } else {
+      kmlText = new TextDecoder('utf-8').decode(ab);
+    }
     const doc     = new DOMParser().parseFromString(kmlText, 'text/xml');
     const lineStrings = doc.querySelectorAll('LineString');
     if (lineStrings.length === 0) { setError('El KMZ no contiene ninguna LineString.'); return; }
@@ -3452,15 +3565,15 @@ async function importarKMZ(file, zona, leafMap, markersRef, polylineRef, setPunt
   }
 }
 
-function TabLinea({ map, onUsarEnTab1 }) {
+// puntos/markersRef/polylineRef viven en App: los marcadores ya están dibujados en el mapa, que no
+// se desmonta al cambiar de pestaña. Con el estado aquí, al volver el panel decía "Activa Dibujar
+// línea" sin botón Limpiar mientras los marcadores seguían pegados en el mapa, imborrables.
+function TabLinea({ map, onUsarEnTab1, puntos, setPuntos, markersRef, polylineRef }) {
   const [modo,     setModo]     = useState('idle'); // 'idle' | 'dibujo'
-  const [puntos,   setPuntos]   = useState([]);
   const [zona,     setZona]     = useState('19S');
   const [resultado,setResultado]= useState(null);
   const [loading,  setLoading]  = useState(false);
   const [error,    setError]    = useState('');
-  const markersRef  = useRef([]);
-  const polylineRef = useRef(null);
 
   // Activar/desactivar modo dibujo
   useEffect(() => {
