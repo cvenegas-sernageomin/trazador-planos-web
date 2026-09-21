@@ -1484,6 +1484,31 @@ function crearTerrainProviderDesdeDEMLocal() {
   });
 }
 
+// Cámara inicial de Vista 3D. Cesium mide la altura de la cámara sobre el elipsoide, no sobre el
+// terreno: con una altura fija (1500 / 5000 m) la cámara quedaba ENTERRADA en cualquier punto más
+// alto que eso —o sea, casi toda la cordillera— y el globo se veía desde adentro: pantalla negra
+// con estrellas. Se calcula sobre el relieve del propio DEM: el mayor entre el punto mirado y el
+// punto desde donde se mira (2 km al sur), más el margen pedido.
+function camaraSobreTerreno(lat, lon, margen) {
+  const latCam = lat - 0.02;
+  const h = (la, lo) => { try { return elevacionLocalSync(la, lo); } catch (e) { return null; } };
+  const base = Math.max(h(lat, lon) ?? 0, h(latCam, lon) ?? 0);
+  return {
+    destination: Cesium.Cartesian3.fromDegrees(lon, latCam, base + margen),
+    orientation: { heading: 0, pitch: Cesium.Math.toRadians(-35), roll: 0 }
+  };
+}
+
+// Centro del DEM activo en lat/lon (el mosaico de área está en Web Mercator, un GeoTIFF propio
+// puede venir en UTM o WGS84: proj4 cubre los tres).
+function centroDEM() {
+  if (!localDEM) return null;
+  const { bbox, crs } = localDEM;
+  const x = (bbox.minX + bbox.maxX) / 2, y = (bbox.minY + bbox.maxY) / 2;
+  const [lon, lat] = (!crs || crs === 'EPSG:4326') ? [x, y] : proj4(crs, 'EPSG:4326', [x, y]);
+  return { lat, lon };
+}
+
 // Modo dibujo de rectángulo en el mapa; llama onDone({minLat,maxLat,minLon,maxLon}).
 // Usa Pointer Events, no los eventos de mouse de Leaflet: en pantalla táctil el navegador no
 // emite mousemove durante un arrastre, así que el rectángulo no se dibujaba y un simple toque
@@ -2149,16 +2174,16 @@ function App() {
         // centrar ahí — es lo que el usuario vino a ver. Si no, donde ya estaba mirando en 2D.
         if (planoEditable) {
           const { lat, lon } = utmToLatLon(planoEditable.E, planoEditable.N, planoEditable.zona);
-          viewer.camera.setView({
-            destination: Cesium.Cartesian3.fromDegrees(lon, lat - 0.02, 1500),
-            orientation: { heading: 0, pitch: Cesium.Math.toRadians(-35), roll: 0 }
-          });
+          viewer.camera.setView(camaraSobreTerreno(lat, lon, 2000));
         } else {
-          const c = leafRef.current ? leafRef.current.getCenter() : { lat: CHILE_CENTER[0], lng: CHILE_CENTER[1] };
-          viewer.camera.setView({
-            destination: Cesium.Cartesian3.fromDegrees(c.lng, c.lat - 0.03, 5000),
-            orientation: { heading: 0, pitch: Cesium.Math.toRadians(-35), roll: 0 }
-          });
+          // Donde ya miraba en 2D; si ese punto cae fuera del DEM (terreno plano a 0 m, sin
+          // nada que ver) se centra en el DEM.
+          const cl = leafRef.current ? leafRef.current.getCenter() : { lat: CHILE_CENTER[0], lng: CHILE_CENTER[1] };
+          let c = { lat: cl.lat, lon: cl.lng };
+          let dentro = null;
+          try { dentro = elevacionLocalSync(c.lat, c.lon); } catch (e) { /* proyección fallida = fuera */ }
+          if (dentro === null) c = centroDEM() || c;
+          viewer.camera.setView(camaraSobreTerreno(c.lat, c.lon, 4000));
         }
         if (!cancelado) setVista3d({ estado: 'listo', error: '' });
       } catch (e) {
