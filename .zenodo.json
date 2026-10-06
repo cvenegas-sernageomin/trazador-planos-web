@@ -1,0 +1,31 @@
+{
+  "upload_type": "software",
+  "title": "Trazador de Planos Geológicos",
+  "description": "<p>Aplicación web que traza la intersección de planos geológicos (rumbo y manteo) con el relieve sobre un modelo de elevación y la exporta a KMZ.</p><p>Publicado en https://cvenegas-sernageomin.github.io/trazador-planos-web/</p><p>La licencia CC BY-NC 4.0 cubre el trabajo original de los autores. No cubre el material de terceros:</p><ul><li>Los modelos de elevación y bases cartográficas conservan las licencias de sus autores.</li><li>Las librerías de terceros incluidas (por ejemplo en vendor/) conservan sus propias licencias.</li></ul>",
+  "creators": [
+    {
+      "name": "Servicio Nacional de Geología y Minería (SERNAGEOMIN)"
+    },
+    {
+      "name": "Venegas Benavides, Carlos",
+      "affiliation": "Servicio Nacional de Geología y Minería (SERNAGEOMIN)"
+    }
+  ],
+  "license": "cc-by-nc-4.0",
+  "access_right": "open",
+  "language": "spa",
+  "keywords": [
+    "geología estructural",
+    "rumbo y manteo",
+    "modelo de elevación",
+    "KMZ",
+    "SERNAGEOMIN"
+  ],
+  "related_identifiers": [
+    {
+      "identifier": "https://cvenegas-sernageomin.github.io/trazador-planos-web/",
+      "relation": "isDocumentedBy",
+      "resource_type": "other"
+    }
+  ]
+}
