@@ -1,5 +1,7 @@
 # Trazador de Planos Geológicos
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23196810.svg)](https://doi.org/10.5281/zenodo.23196810)
+
 Aplicación web que traza la intersección de planos geológicos (rumbo y manteo) con el relieve sobre un modelo de elevación y la exporta a KMZ.
 
 **Publicado:** https://cvenegas-sernageomin.github.io/trazador-planos-web/
@@ -14,4 +16,4 @@ Los modelos de elevación y bases cartográficas conservan las licencias de sus 
 
 Cita sugerida:
 
-> SERNAGEOMIN / Venegas Benavides, C. (2026). Trazador de Planos Geológicos [aplicación web]. https://cvenegas-sernageomin.github.io/trazador-planos-web/
+> SERNAGEOMIN / Venegas Benavides, C. (2026). Trazador de Planos Geológicos [aplicación web]. https://cvenegas-sernageomin.github.io/trazador-planos-web/ · DOI: https://doi.org/10.5281/zenodo.23196810
